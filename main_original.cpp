@@ -1,64 +1,73 @@
-#include <iostream>
-#include <string>
-#include <filesystem>
-#include <vector>
-#include <fstream>
-#include <cmath>
-#include <algorithm>
-#include <sndfile.h>
-#include <stdexcept>
-#include <complex>
-#include <numeric>
-#include <fftw3.h>
-#include <cstring>
-#include <cstdint>
-#include <thread>
-#include <mutex>
+#include <iostream>     // Standard input/output stream operations
+#include <string>       // Implements std::string class
+#include <filesystem>   // File path and directory operations
+#include <vector>       // Dynamic arrays
+#include <fstream>      // File stream operations
+#include <cmath>        // Standard math functions
+#include <algorithm>    // Implements common algorithms
+#include <sndfile.h>    // Read/write audio files
+#include <stdexcept>    // Exception classes
+#include <complex>      // Implements std::complex for FFT or Hilbert transforms
+#include <fftw3.h>      // FFT computations
+#include <cstring>      // C-style string operations
+#include <thread>       // Implements multithreading
+#include <mutex>        // Implements thread synchronization
+// Limit thread count to # of cores
+#include <queue>
+#include <condition_variable>
+#include <atomic>
 
-using namespace std;
+using namespace std;    // Standard namespace
 
 // Declare structs
 struct SampleRange {
-    int first;
-    int second;
+    int startSample;    // Starting sample index
+    int endSample;      // Ending sample index
     
-    SampleRange(int start = 1, int end = -1) : first(start), second(end) {}
+    // Constructor with default values
+    SampleRange(int start = 1, int end = -1) : startSample(start), endSample(end) {}
 };
 
-// Struct for bandpass filter return
 struct BandpassFilterResult {
-    vector<double> filtered_timeseries;
-    vector<double> amplitude_spectrum;
+    vector<double> filtered_timeseries; // Time-domain signal after filtering
+    vector<double> amplitude_spectrum;  // Frequency-domain amplitude spectrum
 
-    // Constructor for convenient initialization
+    // Constructor for initializing both vectors
     BandpassFilterResult(const vector<double>& ts, const vector<double>& spec) 
         : filtered_timeseries(ts), amplitude_spectrum(spec) {}
 };
 
 struct CorrelationResult {
-    vector<double> correlation_values;
-    vector<double> lags;
+    vector<double> correlation_values;  // Cross-correlation values between two signals
+    vector<double> lags;                // Corresponding lag values
 };
 
+// Extracted audio features
 struct AudioFeatures {
-    vector<double> SPLrms;
-    vector<double> SPLpk;
-    vector<double> impulsivity;
-    vector<int> peakcount;
-    vector<vector<double>> autocorr;
-    vector<double> dissim;
+    vector<double> SPLrms;              // Root mean square sound pressure levels
+    vector<double> SPLpk;               // Peak sound pressure levels
+    vector<double> impulsivity;         // Measure signal impulsivity levels
+    vector<int> peakcount;              // Number of peaks detected
+    vector<vector<double>> autocorr;    // Autocorrelation vectors for each segment
+    vector<double> dissim;              // Dissimilarity between segments
 };
 
 struct AudioData {
-    vector<vector<double>> samples; // 2D array: samples[channel][sample]
-    int sampleRate;
+    vector<vector<double>> samples; // 2D array of audio samples
+    int sampleRate;                 // Sampling rate in Hz
 };
 
 struct AudioInfo {
-    int sampleRate;
-    double duration;
+    int sampleRate;     // Sampling rate in Hz
+    double duration;    // Duration of the audio in seconds
 };
 
+struct SoloPerGM2Result {
+    vector<int> peakcount;              // Number of peaks per segment
+    vector<vector<double>> autocorr;    // Autocorrelation values for each segment
+};
+
+// Reading audio files using libsndfile
 class AudioReader {
 public:
     static vector<double> readAudio(const string& filename, int& sampleRate, SampleRange range = {}) {
@@ -73,16 +82,16 @@ public:
         sampleRate = fileInfo.samplerate;
         int totalSamples = fileInfo.frames * fileInfo.channels;
 
-        if (range.second == -1 || range.second > totalSamples) {
-            range.second = totalSamples;
+        if (range.endSample == -1 || range.endSample > totalSamples) {
+            range.endSample = totalSamples;
         }
-        if (range.first < 1 || range.first > range.second) {
+        if (range.startSample < 1 || range.startSample > range.endSample) {
             sf_close(file);
             throw invalid_argument("Invalid sample range.");
         }
 
-        int firstSample = range.first - 1;
-        int sampleCount = range.second - range.first + 1;
+        int firstSample = range.startSample - 1;
+        int sampleCount = range.endSample - range.startSample + 1;
         int frameStart = firstSample / fileInfo.channels;
         int framesToRead = sampleCount / fileInfo.channels;
 
@@ -104,7 +113,7 @@ string fixFilePath(const string& path) {
 }
 
 // Function to read audio file with options similar to MATLAB's audioread
-AudioData audioread(const string& filename, pair<int, int> range = {1, -1}, const string& datatype = "int16") {
+AudioData audioread(const string& filename, SampleRange range = {1, -1}, const string& datatype = "int16") {
     SNDFILE* file;
     SF_INFO sfinfo;
 
@@ -118,8 +127,13 @@ AudioData audioread(const string& filename, pair<int, int> range = {1, -1}, cons
     int totalSamples = sfinfo.frames;
 
     // Handle range parameter
-    int startSample = max(0, range.first - 1);
-    int endSample = (range.second == -1) ? totalSamples : min(range.second, totalSamples);
+    int startSample = max(0, range.startSample - 1);
+    int endSample;
+    if (range.endSample == -1) {
+        endSample = totalSamples;
+    } else {
+        endSample = min(range.endSample, totalSamples);
+    }
     int numSamples = endSample - startSample;
 
     if (numSamples <= 0) {
@@ -193,13 +207,30 @@ vector<double> upsample(const vector<double>& x, int factor) {
     return result;
 }
 
+struct ShiftedArray {
+    double* data;
+    int length;
+
+    ~ShiftedArray() {
+        delete[] data;
+    }
+};
+
 // Function to implement fftshift (Manually shifting zero-frequency to center)
-vector<double> fftshift(const vector<double>& data) {
-    int n = data.size();
-    vector<double> shifted(n);
+ShiftedArray fftshift(const vector<double>& input) {
+    int n = static_cast<int>(input.size());
     int mid = n / 2;
-    rotate_copy(data.begin(), data.begin() + mid, data.end(), shifted.begin());
-    return shifted;
+
+    double* shifted = new double[n];
+
+    for (int i = 0; i < n - mid; ++i) {
+        shifted[i] = input[i + mid];
+    }
+    for (int i = 0; i < mid; ++i) {
+        shifted[n - mid + i] = input[i];
+    }
+
+    return {shifted, n};
 }
 
 // Bandpass filter function
@@ -226,7 +257,7 @@ BandpassFilterResult dylan_bpfilt(
     for (int i = 0; i < npts; ++i) {
         freq[i] = (-npts / 2.0 + i) / reclen;
     }
-    freq = fftshift(freq);
+    ShiftedArray shifted_freq = fftshift(freq);
 
     // Copy FFT result to complex for easier manipulation
     vector<complex<double>> spec(npts);
@@ -240,7 +271,7 @@ BandpassFilterResult dylan_bpfilt(
     }
 
     for (int i = 0; i < npts; ++i) {
-        if (abs(freq[i]) < flow || abs(freq[i]) > fhigh) {
+        if (abs(shifted_freq.data[i]) < flow || abs(shifted_freq.data[i]) > fhigh) {
             spec[i] = 0.0;
         }
     }
@@ -277,14 +308,14 @@ BandpassFilterResult dylan_bpfilt(
 }
 
 // Function to compute SPL values
-vector<double> computeSPL(const vector<double>& rms_values) {
+double* computeSPL(const vector<double>& rms_values, int& out_len) {
     constexpr double eps = 1e-12;
-    vector<double> spl_values;
-    spl_values.reserve(rms_values.size());
+    out_len = static_cast<int>(rms_values.size());
 
-    for (int i = 0; i < rms_values.size(); i++) {
+    double* spl_values = new double[out_len];
+    for (int i = 0; i < out_len; ++i) {
         double rms = rms_values[i];
-        spl_values.push_back(20 * log10(max(rms, eps)));
+        spl_values[i] = 20 * log10(std::max(rms, eps));
     }
 
     return spl_values;
@@ -359,7 +390,7 @@ CorrelationResult correl_5(const vector<double>& ts1, const vector<double>& ts2,
     return CorrelationResult{P, nlags};
 }
 
-pair<vector<int>, vector<vector<double>>> f_solo_per_GM2(
+SoloPerGM2Result f_solo_per_GM2(
     const vector<double>& p_filt_input, double fs, double timewin, double avtime) {
     
     vector<double> p_avtot;
@@ -452,7 +483,12 @@ pair<vector<int>, vector<vector<double>>> f_solo_per_GM2(
         pkcount[zz] = peak_count;
     }
     
-    return {pkcount, acorr};
+    // Create and return a struct
+    SoloPerGM2Result result;
+    result.peakcount = pkcount;
+    result.autocorr = acorr;
+    
+    return result;
 }
 
 vector<complex<double>> hilbert(const vector<double>& xr, int n = -1) {
@@ -464,7 +500,11 @@ vector<complex<double>> hilbert(const vector<double>& xr, int n = -1) {
     // Prepare FFT input with zero-padding or truncation
     double* in = (double*)fftw_malloc(sizeof(double) * n);
     fill(in, in + n, 0.0);  // Zero-initialize
-    copy(xr.begin(), xr.begin() + min(xr.size(), static_cast<size_t>(n)), in);
+
+    int copyLen = min(static_cast<int>(xr.size()), n);
+    for (int i = 0; i < copyLen; ++i) {
+        in[i] = xr[i];
+    }
 
     // FFT output buffer
     fftw_complex* out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * n);
@@ -857,7 +897,7 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
     int total_samples = info.sampleRate * info.duration;
 
     // Call audioread with dynamic range
-    auto audio = audioread(file_path, make_pair(1, total_samples), "double");
+    auto audio = audioread(file_path, SampleRange{1, total_samples}, "double");
 
     int fs = audio.sampleRate;
     vector<double> x = audio.samples[0];
@@ -932,7 +972,10 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
     }
 
     // Calculate features
-    features.SPLrms = computeSPL(rms(timechunk_matrix));
+    int spl_len = 0;
+    double* spl_array = computeSPL(rms(timechunk_matrix), spl_len);
+    features.SPLrms = vector<double>(spl_array, spl_array + spl_len);
+    delete[] spl_array;
     features.SPLpk = calculateSPLpkhold(timechunk_matrix);
 
     vector<double> kmat(timechunk_matrix.size(), 0.0);
@@ -941,9 +984,9 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
     }
     features.impulsivity = kmat;
 
-    auto result = f_solo_per_GM2(p_filt_padded, fs, timewin, avtime);
-    features.peakcount = get<0>(result);
-    features.autocorr = get<1>(result);
+    SoloPerGM2Result result = f_solo_per_GM2(p_filt_padded, fs, timewin, avtime);
+    features.peakcount = result.peakcount;
+    features.autocorr = result.autocorr;
 
     features.dissim = f_solo_dissim_GM1(timechunk_matrix, pts_per_timewin, num_timewin, fft_win, fs);
 
@@ -971,14 +1014,14 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
     outputFile << "Filename,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount,";
 
     // Find maximum autocorrelation size (rows x cols)
-    size_t maxAutocorrRows = 0;
-    size_t maxAutocorrCols = 0;
-    for (int i = 0; i < allFeatures.size(); i++) {
+    int maxAutocorrRows = 0;
+    int maxAutocorrCols = 0;
+    for (int i = 0; i < static_cast<int>(allFeatures.size()); ++i) {
         const auto& feature = allFeatures[i];
         if (!feature.autocorr.empty()) {
-            maxAutocorrRows = max(maxAutocorrRows, feature.autocorr.size());
+            maxAutocorrRows = std::max(maxAutocorrRows, static_cast<int>(feature.autocorr.size()));
             if (!feature.autocorr[0].empty()) {
-                maxAutocorrCols = max(maxAutocorrCols, feature.autocorr[0].size());
+                maxAutocorrCols = std::max(maxAutocorrCols, static_cast<int>(feature.autocorr[0].size()));
             }
         }
     }
@@ -995,16 +1038,16 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
     outputFile << endl;
 
     // Process each file's features
-    for (int fileIdx = 0; fileIdx < allFeatures.size(); ++fileIdx) {
+    for (int fileIdx = 0; fileIdx < static_cast<int>(allFeatures.size()); ++fileIdx) {
         const AudioFeatures& features = allFeatures[fileIdx];
 
         // Determine maximum length among all feature vectors
-        int maxLength = max({
-            features.SPLrms.size(),
-            features.SPLpk.size(),
-            features.impulsivity.size(),
-            features.dissim.size(),
-            features.peakcount.size()
+        int maxLength = std::max({
+            static_cast<int>(features.SPLrms.size()),
+            static_cast<int>(features.SPLpk.size()),
+            static_cast<int>(features.impulsivity.size()),
+            static_cast<int>(features.dissim.size()),
+            static_cast<int>(features.peakcount.size())
         });
 
         // Write feature rows
@@ -1065,59 +1108,141 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
 }
 
 int main(int argc, char* argv[]) {
-    string input_dir = "C:/Users/rakos/OneDrive/Desktop/MATLAB Code/Audio/runThisInput/long_recording";
-    string output_file = "C:/Users/rakos/OneDrive/Desktop/MATLAB Code/Audio/runThisOutput/cpp_output.csv";
+    // Parameters provided by user using command line arguments
+    string input_dir;   // Directory containing sound files
+    string output_file; // Output file path
+    int num_bits;       // Number of bits (16, 24, etc.)
+    double RS;          // Reference sensitivity
+    int peak_volts;     // Signal voltage
+    int arti;           // Presence of calbiration tone (0 = no, 1 = yes)
+    int timewin;        // Analysis time window (seconds)
+    int fft_win;        // FFT window (seconds)
+    double avtime;      // Average time for smoothing
+    int flow;           // Low frequency cutoff (Hz)
+    int fhigh;          // High frequency cutoff (Hz)
 
-    if (argc > 1) {
-        input_dir = argv[1];
-    }
-    if (argc > 2) {
-        output_file = argv[2];
-    }
-
-    int num_bits = 16;
-    double RS = -178.3;
-    int peak_volts = 2;
-    int arti = 1;
-    int timewin = 60;
-    int fft_win = 1;
-    double avtime = 0.1;
-    int flow = 1;
-    int fhigh = 192000;
-
-    vector<AudioFeatures> allFeatures;
-    vector<string> filenames;
-
-    mutex mtx;
-    vector<thread> threads;
-
-    auto dirIt = filesystem::directory_iterator(input_dir);
-    vector<filesystem::directory_entry> entries(dirIt, filesystem::directory_iterator{});
-
-    for (int i = 0; i < entries.size(); i++) {
-        const auto& file_dir = entries[i];
-        if (file_dir.path().extension() == ".wav") {
-            threads.emplace_back([&, file_dir]() {
-                try {
-                    cout << "Processing: " << file_dir.path().filename() << endl;
-                    AudioFeatures features = f_WAV_frankenfunction_reilly(
-                        num_bits, peak_volts, file_dir, RS, timewin, avtime, fft_win, arti, flow, fhigh);
-
-                    lock_guard<mutex> lock(mtx);
-                    allFeatures.push_back(move(features));
-                    filenames.push_back(file_dir.path().filename().string());
-                } catch (const exception& e) {
-                    lock_guard<mutex> lock(mtx);
-                    cerr << "Error processing " << file_dir.path().filename() << ": " << e.what() << endl;
-                }
-            });
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        string arg = argv[i];
+        
+        if (arg == "--input" || arg == "-i") { // Input directory
+            if (i + 1 < argc) {
+                input_dir = argv[++i];
+            }
+        } else if (arg == "--output" || arg == "-o") { // Output file
+            if (i + 1 < argc) {
+                output_file = argv[++i];
+            }
+        } else if (arg == "--num_bits" || arg == "-nb") { // Number of bits
+            if (i + 1 < argc) {
+                num_bits = stoi(argv[++i]);
+            }
+        } else if (arg == "--RS" || arg == "-rs") { // Reference sensitivity
+            if (i + 1 < argc) {
+                RS = stod(argv[++i]);
+            }
+        } else if (arg == "--peak_volts" || arg == "-pv") { // Signal voltage
+            if (i + 1 < argc) {
+                peak_volts = stoi(argv[++i]);
+            }
+        } else if (arg == "--arti" || arg == "-a") { // Calibration tone presence
+            if (i + 1 < argc) {
+                arti = stoi(argv[++i]);
+            }
+        } else if (arg == "--timewin" || arg == "-tw") { // Time window
+            if (i + 1 < argc) {
+                timewin = stoi(argv[++i]);
+            }
+        } else if (arg == "--fft_win" || arg == "-fw") { // FFT window
+            if (i + 1 < argc) {
+                fft_win = stoi(argv[++i]);
+            }
+        } else if (arg == "--avtime" || arg == "-at") { // Average time
+            if (i + 1 < argc) {
+                avtime = stod(argv[++i]);
+            }
+        } else if (arg == "--flow" || arg == "-fl") { // Low frequency
+            if (i + 1 < argc) {
+                flow = stoi(argv[++i]);
+            }
+        } else if (arg == "--fhigh" || arg == "-fh") { // High frequency
+            if (i + 1 < argc) {
+                fhigh = stoi(argv[++i]);
+            }
         }
     }
 
-    for (int i = 0; i < threads.size(); i++) {
-        threads[i].join();
+    // Display user-provided parameters
+    cout << "Running with parameters:" << endl;
+    cout << "  Input directory: " << input_dir << endl;
+    cout << "  Output file: " << output_file << endl;
+    cout << "  Number of bits: " << num_bits << endl;
+    cout << "  RS: " << RS << endl;
+    cout << "  Peak volts: " << peak_volts << endl;
+    cout << "  Arti: " << arti << endl;
+    cout << "  Time window: " << timewin << endl;
+    cout << "  FFT window: " << fft_win << endl;
+    cout << "  Average time: " << avtime << endl;
+    cout << "  Flow frequency: " << flow << endl;
+    cout << "  High frequency: " << fhigh << endl;
+
+    vector<AudioFeatures> allFeatures; // Results
+    vector<string> filenames; // Names of files in input directory
+    mutex mtx; // Protect shared data across threads
+    
+    // Work queue for .wav files
+    queue<filesystem::directory_entry> workQueue;
+    for (const auto& entry : filesystem::directory_iterator(input_dir)) {
+        if (entry.path().extension() == ".wav") {
+            workQueue.push(entry);
+        }
     }
 
+    // Detect number of hardware threads
+    unsigned int numThreads = thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4; // Fallback if detection fails
+
+    // Worker thread function
+    auto worker = [&]() {
+        while (true) {
+            filesystem::directory_entry file;
+
+            // Fetch next file to process
+            {
+                lock_guard<mutex> lock(mtx);
+                if (workQueue.empty()) return;
+                file = workQueue.front();
+                workQueue.pop();
+            }
+
+            try {
+                cout << "Processing: " << file.path().filename() << endl;
+                AudioFeatures features = f_WAV_frankenfunction_reilly(
+                    num_bits, peak_volts, file, RS, timewin, avtime, fft_win, arti, flow, fhigh);
+
+                lock_guard<mutex> lock(mtx);
+                allFeatures.push_back(move(features));
+                filenames.push_back(file.path().filename().string());
+
+            } catch (const exception& e) {
+                lock_guard<mutex> lock(mtx);
+                cerr << "Error processing " << file.path().filename() << ": " << e.what() << endl;
+            }
+        }
+    };
+
+    // Launch thread pool
+    vector<thread> threads; // Process multiple files simultaneously
+    for (unsigned int i = 0; i < numThreads; ++i) {
+        threads.emplace_back(worker);
+    }
+
+    // Wait for all threads to finish
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Save results to CSV
     if (!allFeatures.empty()) {
         saveFeaturesToCSV(output_file, filenames, allFeatures);
         cout << "Successfully saved features for " << allFeatures.size() << " files to " << output_file << endl;
