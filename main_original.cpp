@@ -735,97 +735,27 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
 }
 
 vector<double> audioread(const string& filename, int& sampleRate) {
-    ifstream file(filename, ios::binary);
+    SF_INFO sfinfo = {};
+    SNDFILE* file = sf_open(filename.c_str(), SFM_READ, &sfinfo);
     if (!file) {
-        cerr << "Error: Could not open file " << filename << endl;
-        exit(EXIT_FAILURE);
+        throw runtime_error("Error opening file: " + string(sf_strerror(nullptr)));
     }
 
-    char chunkId[4];
-    file.read(chunkId, 4); // "RIFF"
-    file.ignore(4);        // Chunk size
-    file.read(chunkId, 4); // "WAVE"
-    file.read(chunkId, 4); // "fmt "
+    sampleRate = sfinfo.samplerate;
+    int numChannels = sfinfo.channels;
+    int numFrames = sfinfo.frames;
 
-    if (strncmp(chunkId, "fmt ", 4) != 0) {
-        cerr << "Error: Invalid WAV file (no fmt chunk)" << endl;
-        exit(EXIT_FAILURE);
+    vector<double> interleaved(numFrames * numChannels);
+    sf_readf_double(file, interleaved.data(), numFrames);
+    sf_close(file);
+
+    // Extract first channel
+    vector<double> channelData(numFrames);
+    for (int i = 0; i < numFrames; ++i) {
+        channelData[i] = interleaved[i * numChannels]; // first channel only
     }
 
-    int subchunk1Size;
-    file.read(reinterpret_cast<char*>(&subchunk1Size), 4);
-    int audioFormat;
-    file.read(reinterpret_cast<char*>(&audioFormat), 2);
-    int numChannels;
-    file.read(reinterpret_cast<char*>(&numChannels), 2);
-    int sampleRateRaw;
-    file.read(reinterpret_cast<char*>(&sampleRateRaw), 4);
-    sampleRate = static_cast<int>(sampleRateRaw);
-    file.ignore(6); // Byte rate + block align
-    int bitsPerSample;
-    file.read(reinterpret_cast<char*>(&bitsPerSample), 2);
-
-    if (audioFormat != 1 && audioFormat != 3) {
-        cerr << "Error: Only PCM (1) or IEEE float (3) formats supported" << endl;
-        exit(EXIT_FAILURE);
-    }
-
-    // Skip extra fmt bytes if any
-    if (subchunk1Size > 16) {
-        file.ignore(subchunk1Size - 16);
-    }
-
-    // Find "data" subchunk
-    while (true) {
-        file.read(chunkId, 4);
-        int chunkSize;
-        file.read(reinterpret_cast<char*>(&chunkSize), 4);
-
-        if (strncmp(chunkId, "data", 4) == 0) {
-            break;
-        } else {
-            file.ignore(chunkSize); // Skip other chunks
-        }
-    }
-
-    vector<double> audioData;
-
-    if (bitsPerSample == 16) {
-        vector<int> buffer;
-        int sample;
-        while (file.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
-            buffer.push_back(sample);
-        }
-        audioData.reserve(buffer.size() / numChannels);
-        for (int i = 0; i < buffer.size(); i += numChannels) {
-            audioData.push_back(buffer[i] / 32768.0); // Normalize to [-1, 1]
-        }
-    } else if (bitsPerSample == 32 && audioFormat == 3) {
-        vector<float> buffer;
-        float sample;
-        while (file.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
-            buffer.push_back(sample);
-        }
-        audioData.reserve(buffer.size() / numChannels);
-        for (int i = 0; i < buffer.size(); i += numChannels) {
-            audioData.push_back(static_cast<double>(buffer[i])); // First channel
-        }
-    } else if (bitsPerSample == 24) {
-        vector<int> buffer(3);
-        while (file.read(reinterpret_cast<char*>(buffer.data()), 3)) {
-            int sample = (buffer[2] << 16) | (buffer[1] << 8) | buffer[0];
-            // Sign-extend 24-bit to 32-bit
-            if (sample & 0x800000) {
-                sample |= 0xFF000000;
-            }
-            audioData.push_back(sample / 8388608.0); // Normalize to [-1, 1]
-            for (int i = 1; i < numChannels; ++i) {
-                file.ignore(3); // Skip other channels
-            }
-        }
-    }
-
-    return audioData;
+    return channelData;
 }
 
 // Function to compute RMS (Root Mean Square) of a vector
@@ -1109,70 +1039,51 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
 
 int main(int argc, char* argv[]) {
     // Parameters provided by user using command line arguments
-    string input_dir;   // Directory containing sound files
-    string output_file; // Output file path
-    int num_bits;       // Number of bits (16, 24, etc.)
-    double RS;          // Reference sensitivity
-    int peak_volts;     // Signal voltage
-    int arti;           // Presence of calbiration tone (0 = no, 1 = yes)
-    int timewin;        // Analysis time window (seconds)
-    int fft_win;        // FFT window (seconds)
-    double avtime;      // Average time for smoothing
-    int flow;           // Low frequency cutoff (Hz)
-    int fhigh;          // High frequency cutoff (Hz)
+    string input_dir;
+    string output_file;
+    int num_bits = 16;
+    double RS = -160.0;
+    int peak_volts = 2;
+    int arti = 1;
+    int timewin = 60;
+    int fft_win = 1;
+    double avtime = 0.1;
+    int flow = 1;
+    int fhigh = 192000;
+    unsigned int max_threads = 4; // Default thread cap
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
-        
-        if (arg == "--input" || arg == "-i") { // Input directory
-            if (i + 1 < argc) {
-                input_dir = argv[++i];
-            }
-        } else if (arg == "--output" || arg == "-o") { // Output file
-            if (i + 1 < argc) {
-                output_file = argv[++i];
-            }
-        } else if (arg == "--num_bits" || arg == "-nb") { // Number of bits
-            if (i + 1 < argc) {
-                num_bits = stoi(argv[++i]);
-            }
-        } else if (arg == "--RS" || arg == "-rs") { // Reference sensitivity
-            if (i + 1 < argc) {
-                RS = stod(argv[++i]);
-            }
-        } else if (arg == "--peak_volts" || arg == "-pv") { // Signal voltage
-            if (i + 1 < argc) {
-                peak_volts = stoi(argv[++i]);
-            }
-        } else if (arg == "--arti" || arg == "-a") { // Calibration tone presence
-            if (i + 1 < argc) {
-                arti = stoi(argv[++i]);
-            }
-        } else if (arg == "--timewin" || arg == "-tw") { // Time window
-            if (i + 1 < argc) {
-                timewin = stoi(argv[++i]);
-            }
-        } else if (arg == "--fft_win" || arg == "-fw") { // FFT window
-            if (i + 1 < argc) {
-                fft_win = stoi(argv[++i]);
-            }
-        } else if (arg == "--avtime" || arg == "-at") { // Average time
-            if (i + 1 < argc) {
-                avtime = stod(argv[++i]);
-            }
-        } else if (arg == "--flow" || arg == "-fl") { // Low frequency
-            if (i + 1 < argc) {
-                flow = stoi(argv[++i]);
-            }
-        } else if (arg == "--fhigh" || arg == "-fh") { // High frequency
-            if (i + 1 < argc) {
-                fhigh = stoi(argv[++i]);
-            }
+
+        if (arg == "--input" || arg == "-i") {
+            if (i + 1 < argc) input_dir = argv[++i];
+        } else if (arg == "--output" || arg == "-o") {
+            if (i + 1 < argc) output_file = argv[++i];
+        } else if (arg == "--num_bits" || arg == "-nb") {
+            if (i + 1 < argc) num_bits = stoi(argv[++i]);
+        } else if (arg == "--RS" || arg == "-rs") {
+            if (i + 1 < argc) RS = stod(argv[++i]);
+        } else if (arg == "--peak_volts" || arg == "-pv") {
+            if (i + 1 < argc) peak_volts = stoi(argv[++i]);
+        } else if (arg == "--arti" || arg == "-a") {
+            if (i + 1 < argc) arti = stoi(argv[++i]);
+        } else if (arg == "--timewin" || arg == "-tw") {
+            if (i + 1 < argc) timewin = stoi(argv[++i]);
+        } else if (arg == "--fft_win" || arg == "-fw") {
+            if (i + 1 < argc) fft_win = stoi(argv[++i]);
+        } else if (arg == "--avtime" || arg == "-at") {
+            if (i + 1 < argc) avtime = stod(argv[++i]);
+        } else if (arg == "--flow" || arg == "-fl") {
+            if (i + 1 < argc) flow = stoi(argv[++i]);
+        } else if (arg == "--fhigh" || arg == "-fh") {
+            if (i + 1 < argc) fhigh = stoi(argv[++i]);
+        } else if (arg == "--max_threads" || arg == "-mt") {
+            if (i + 1 < argc) max_threads = stoi(argv[++i]);
         }
     }
 
-    // Display user-provided parameters
+    // Display parameters
     cout << "Running with parameters:" << endl;
     cout << "  Input directory: " << input_dir << endl;
     cout << "  Output file: " << output_file << endl;
@@ -1185,29 +1096,30 @@ int main(int argc, char* argv[]) {
     cout << "  Average time: " << avtime << endl;
     cout << "  Flow frequency: " << flow << endl;
     cout << "  High frequency: " << fhigh << endl;
+    cout << "  Max threads: " << max_threads << endl;
 
-    vector<AudioFeatures> allFeatures; // Results
-    vector<string> filenames; // Names of files in input directory
-    mutex mtx; // Protect shared data across threads
-    
-    // Work queue for .wav files
+    vector<AudioFeatures> allFeatures;
+    vector<string> filenames;
+    mutex mtx;
     queue<filesystem::directory_entry> workQueue;
+
     for (const auto& entry : filesystem::directory_iterator(input_dir)) {
         if (entry.path().extension() == ".wav") {
             workQueue.push(entry);
         }
     }
 
-    // Detect number of hardware threads
-    unsigned int numThreads = thread::hardware_concurrency();
-    if (numThreads == 0) numThreads = 4; // Fallback if detection fails
+    // Get number of logical cores, fallback if needed
+    unsigned int availableThreads = thread::hardware_concurrency();
+    if (availableThreads == 0) availableThreads = 2;
 
-    // Worker thread function
+    // Cap threads based on user-defined or default
+    unsigned int numThreads = min(max_threads, availableThreads);
+
     auto worker = [&]() {
         while (true) {
             filesystem::directory_entry file;
 
-            // Fetch next file to process
             {
                 lock_guard<mutex> lock(mtx);
                 if (workQueue.empty()) return;
@@ -1223,7 +1135,6 @@ int main(int argc, char* argv[]) {
                 lock_guard<mutex> lock(mtx);
                 allFeatures.push_back(move(features));
                 filenames.push_back(file.path().filename().string());
-
             } catch (const exception& e) {
                 lock_guard<mutex> lock(mtx);
                 cerr << "Error processing " << file.path().filename() << ": " << e.what() << endl;
@@ -1231,18 +1142,15 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // Launch thread pool
-    vector<thread> threads; // Process multiple files simultaneously
+    // Launch threads
+    vector<thread> threads;
     for (unsigned int i = 0; i < numThreads; ++i) {
         threads.emplace_back(worker);
     }
 
-    // Wait for all threads to finish
-    for (auto& t : threads) {
-        t.join();
-    }
+    for (auto& t : threads) t.join();
 
-    // Save results to CSV
+    // Save results
     if (!allFeatures.empty()) {
         saveFeaturesToCSV(output_file, filenames, allFeatures);
         cout << "Successfully saved features for " << allFeatures.size() << " files to " << output_file << endl;
