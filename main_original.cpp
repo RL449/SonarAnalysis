@@ -1,5 +1,5 @@
 #include <iostream>     // Standard input/output stream operations
-#include <string>       // Implements std::string class
+#include <string>       // Implements string class
 #include <filesystem>   // File path and directory operations
 #include <vector>       // Dynamic arrays
 #include <fstream>      // File stream operations
@@ -7,7 +7,7 @@
 #include <algorithm>    // Implements common algorithms
 #include <sndfile.h>    // Read/write audio files
 #include <stdexcept>    // Exception classes
-#include <complex>      // Implements std::complex for FFT or Hilbert transforms
+#include <complex>      // Implements complex for FFT or Hilbert transforms
 #include <fftw3.h>      // FFT computations
 #include <cstring>      // C-style string operations
 #include <thread>       // Implements multithreading
@@ -20,24 +20,23 @@
 using namespace std;    // Standard namespace
 
 // Declare structs
+
 struct SampleRange {
     int startSample;    // Starting sample index
     int endSample;      // Ending sample index
-    
-    // Constructor with default values
+    // Constructor with default range
     SampleRange(int start = 1, int end = -1) : startSample(start), endSample(end) {}
 };
 
-struct BandpassFilterResult {
+struct BandpassFilter {
     vector<double> filtered_timeseries; // Time-domain signal after filtering
     vector<double> amplitude_spectrum;  // Frequency-domain amplitude spectrum
-
-    // Constructor for initializing both vectors
-    BandpassFilterResult(const vector<double>& ts, const vector<double>& spec) 
+    // Constructor initializing both vectors
+    BandpassFilter(const vector<double>& ts, const vector<double>& spec)
         : filtered_timeseries(ts), amplitude_spectrum(spec) {}
 };
 
-struct CorrelationResult {
+struct Correlation {
     vector<double> correlation_values;  // Cross-correlation values between two signals
     vector<double> lags;                // Corresponding lag values
 };
@@ -62,124 +61,124 @@ struct AudioInfo {
     double duration;    // Duration of the audio in seconds
 };
 
-struct SoloPerGM2Result {
+struct SoloPerGM2 {
     vector<int> peakcount;              // Number of peaks per segment
     vector<vector<double>> autocorr;    // Autocorrelation values for each segment
 };
 
-// Reading audio files using libsndfile
-class AudioReader {
-public:
-    static vector<double> readAudio(const string& filename, int& sampleRate, SampleRange range = {}) {
-        SNDFILE* file;
-        SF_INFO fileInfo = {};
-        
-        file = sf_open(filename.c_str(), SFM_READ, &fileInfo);
-        if (!file) {
-            throw runtime_error("Error opening file: " + string(sf_strerror(file)));
-        }
+struct ArrayShiftFFT {
+    double* data;
+    int length;
 
-        sampleRate = fileInfo.samplerate;
-        int totalSamples = fileInfo.frames * fileInfo.channels;
-
-        if (range.endSample == -1 || range.endSample > totalSamples) {
-            range.endSample = totalSamples;
-        }
-        if (range.startSample < 1 || range.startSample > range.endSample) {
-            sf_close(file);
-            throw invalid_argument("Invalid sample range.");
-        }
-
-        int firstSample = range.startSample - 1;
-        int sampleCount = range.endSample - range.startSample + 1;
-        int frameStart = firstSample / fileInfo.channels;
-        int framesToRead = sampleCount / fileInfo.channels;
-
-        vector<double> buffer(framesToRead * fileInfo.channels);
-        
-        sf_seek(file, frameStart, SEEK_SET);
-        sf_readf_double(file, buffer.data(), framesToRead);
-        sf_close(file);
-
-        return buffer;
+    ~ArrayShiftFFT() {
+        delete[] data;
     }
 };
 
+// Replaces "\\" in file path with "/"
 string fixFilePath(const string& path) {
-    // Replaces "\\" in file path with "/"
     string fixed_path = path;
     replace(fixed_path.begin(), fixed_path.end(), '\\', '/');
     return fixed_path;
 }
 
-// Function to read audio file with options similar to MATLAB's audioread
-AudioData audioread(const string& filename, SampleRange range = {1, -1}, const string& datatype = "int16") {
+// Read audio file and extract recording metadata
+AudioData audioread(const string& filename, SampleRange range = {1, -1}) {
     SNDFILE* file;
-    SF_INFO sfinfo;
+    SF_INFO sfinfo = {};
 
-    // Open the audio file
     file = sf_open(filename.c_str(), SFM_READ, &sfinfo);
     if (!file) {
-        throw runtime_error("Error opening audio file.");
+        throw runtime_error("Error opening audio file: " + string(sf_strerror(file)));
     }
 
     int numChannels = sfinfo.channels;
-    int totalSamples = sfinfo.frames;
+    int totalFrames = sfinfo.frames;
 
-    // Handle range parameter
     int startSample = max(0, range.startSample - 1);
     int endSample;
     if (range.endSample == -1) {
-        endSample = totalSamples;
+        endSample = totalFrames;
     } else {
-        endSample = min(range.endSample, totalSamples);
+        endSample = min(range.endSample, totalFrames);
     }
-    int numSamples = endSample - startSample;
+    int numFramesToRead = endSample - startSample;
 
-    if (numSamples <= 0) {
+    if (numFramesToRead <= 0) {
         sf_close(file);
         throw runtime_error("Invalid sample range.");
     }
 
-    // Read samples as int16_t
-    vector<int16_t> interleavedSamples(numSamples * numChannels);
     sf_seek(file, startSample, SEEK_SET);
-    sf_readf_short(file, interleavedSamples.data(), numSamples);
-    sf_close(file);
 
-    // Deinterleave and convert to double
-    vector<vector<double>> samples(numChannels, vector<double>(numSamples));
-    for (int i = 0; i < numSamples; ++i) {
+    vector<vector<double>> samples(numChannels, vector<double>(numFramesToRead));
+    vector<double> interleavedSamples(numFramesToRead * numChannels);
+
+    int format = sfinfo.format & SF_FORMAT_SUBMASK;
+
+    // Bit agnostic frame read
+    switch (format) {
+        case SF_FORMAT_PCM_16: { // 16 bits
+            vector<short> temp(numFramesToRead * numChannels);
+            sf_readf_short(file, temp.data(), numFramesToRead);
+            for (size_t i = 0; i < temp.size(); ++i)
+                interleavedSamples[i] = static_cast<double>(temp[i]);
+            break;
+        }
+        case SF_FORMAT_PCM_24:
+        case SF_FORMAT_PCM_32: { // 24 or 32 bit
+            vector<int> temp(numFramesToRead * numChannels);
+            sf_readf_int(file, temp.data(), numFramesToRead);
+            for (size_t i = 0; i < temp.size(); ++i)
+                interleavedSamples[i] = static_cast<double>(temp[i]);
+            break;
+        }
+        case SF_FORMAT_FLOAT: {
+            vector<float> temp(numFramesToRead * numChannels);
+            sf_readf_float(file, temp.data(), numFramesToRead);
+            for (size_t i = 0; i < temp.size(); ++i)
+                interleavedSamples[i] = static_cast<double>(temp[i]);
+            break;
+        }
+        case SF_FORMAT_DOUBLE: {
+            vector<double> temp(numFramesToRead * numChannels);
+            sf_readf_double(file, temp.data(), numFramesToRead);
+            interleavedSamples = temp;
+            break;
+        }
+        default:
+            sf_close(file);
+            throw runtime_error("Unsupported or unhandled audio format.");
+    }
+
+    sf_close(file); // Close file
+
+    // Write bit-normalized 
+    for (int i = 0; i < numFramesToRead; ++i) {
         for (int ch = 0; ch < numChannels; ++ch) {
-            samples[ch][i] = static_cast<double>(interleavedSamples[i * numChannels + ch]);
+            samples[ch][i] = interleavedSamples[i * numChannels + ch];
         }
     }
 
-    return AudioData{samples, sfinfo.samplerate};
+    return AudioData{samples, sfinfo.samplerate}; // Return normalized sample / sample rate
 }
 
 AudioInfo audioread_info(const string& file_path) {
-    // Declare the SF_INFO structure
-    SF_INFO sfInfo = {0};
+    SF_INFO sfInfo = {0}; // Struct declaration
+    SNDFILE* file = sf_open(file_path.c_str(), SFM_READ, &sfInfo); // Open audio file
 
-    // Open the audio file
-    SNDFILE* file = sf_open(file_path.c_str(), SFM_READ, &sfInfo);
-
-    if (!file) {
+    if (!file) { // Error opening file
         throw runtime_error("Error opening audio file: " + file_path);
     }
 
-    // Get the sample rate and the number of frames
+    // Get sample rate and # of frames
     int sampleRate = sfInfo.samplerate;
     int numFrames = sfInfo.frames;
 
-    // Calculate the duration in seconds
-    float duration = static_cast<float>(numFrames) / sampleRate;
+    float duration = static_cast<float>(numFrames) / sampleRate; // Calculate duration in seconds
 
-    // Close the file after reading the info
-    sf_close(file);
+    sf_close(file); // Close file after reading info
 
-    // Return the gathered information
     return {sampleRate, duration};
 }
 
@@ -207,17 +206,8 @@ vector<double> upsample(const vector<double>& x, int factor) {
     return result;
 }
 
-struct ShiftedArray {
-    double* data;
-    int length;
-
-    ~ShiftedArray() {
-        delete[] data;
-    }
-};
-
-// Function to implement fftshift (Manually shifting zero-frequency to center)
-ShiftedArray fftshift(const vector<double>& input) {
+// Manually shift zero-frequency to center
+ArrayShiftFFT fftshift(const vector<double>& input) {
     int n = static_cast<int>(input.size());
     int mid = n / 2;
 
@@ -234,13 +224,11 @@ ShiftedArray fftshift(const vector<double>& input) {
 }
 
 // Bandpass filter function
-BandpassFilterResult dylan_bpfilt(
-    const vector<double>& ts, double samint, double flow, double fhigh) {
-
+BandpassFilter dylan_bpfilt(const vector<double>& ts, double samint, double flow, double fhigh) {
     int npts = ts.size();
     double reclen = npts * samint;
 
-    // Allocate and fill input
+    // Allocate / fill input
     fftw_complex* in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * npts);
     fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * npts);
     fftw_plan plan = fftw_plan_dft_1d(npts, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
@@ -250,14 +238,14 @@ BandpassFilterResult dylan_bpfilt(
         in[i][1] = 0.0;
     }
 
-    fftw_execute(plan);  // out holds the FFT result
+    fftw_execute(plan);  // Out holds the FFT result
 
-    // Construct frequency vector and apply fftshift
+    // Construct frequency vector / apply fftshift
     vector<double> freq(npts);
     for (int i = 0; i < npts; ++i) {
         freq[i] = (-npts / 2.0 + i) / reclen;
     }
-    ShiftedArray shifted_freq = fftshift(freq);
+    ArrayShiftFFT shifted_freq = fftshift(freq);
 
     // Copy FFT result to complex for easier manipulation
     vector<complex<double>> spec(npts);
@@ -285,7 +273,7 @@ BandpassFilterResult dylan_bpfilt(
         out[i][1] = spec[i].imag();
     }
 
-    fftw_execute(ifft_plan);  // in now has the IFFT result
+    fftw_execute(ifft_plan);  // In now has the IFFT result
 
     vector<double> tsfilt(npts);
     for (int i = 0; i < npts; ++i) {
@@ -307,7 +295,7 @@ BandpassFilterResult dylan_bpfilt(
     return {tsfilt, aspec};
 }
 
-// Function to compute SPL values
+// Compute SPL values
 double* computeSPL(const vector<double>& rms_values, int& out_len) {
     constexpr double eps = 1e-12;
     out_len = static_cast<int>(rms_values.size());
@@ -315,12 +303,13 @@ double* computeSPL(const vector<double>& rms_values, int& out_len) {
     double* spl_values = new double[out_len];
     for (int i = 0; i < out_len; ++i) {
         double rms = rms_values[i];
-        spl_values[i] = 20 * log10(std::max(rms, eps));
+        spl_values[i] = 20 * log10(max(rms, eps));
     }
 
     return spl_values;
 }
 
+// Compute kurtosis 
 double calculate_kurtosis(const vector<double>& data) {
     if (data.empty()) {
         throw invalid_argument("Data vector is empty");
@@ -348,7 +337,8 @@ double calculate_kurtosis(const vector<double>& data) {
     return kurtosis; // Return raw kurtosis
 }
 
-CorrelationResult correl_5(const vector<double>& ts1, const vector<double>& ts2, int lags, int offset) {
+// Calculate autocorrelation matrix
+Correlation correl_5(const vector<double>& ts1, const vector<double>& ts2, int lags, int offset) {
     vector<double> P(lags + 1);
     vector<double> nlags(lags + 1);
 
@@ -387,25 +377,23 @@ CorrelationResult correl_5(const vector<double>& ts1, const vector<double>& ts2,
         nlags[i] = i;
     }
 
-    return CorrelationResult{P, nlags};
+    return Correlation{P, nlags};
 }
 
-SoloPerGM2Result f_solo_per_GM2(
-    const vector<double>& p_filt_input, double fs, double timewin, double avtime) {
-    
+SoloPerGM2 f_solo_per_GM2(const vector<double>& p_filt_input, double fs, double timewin, double avtime) {
     vector<double> p_avtot;
     int avwin = static_cast<int>(fs * avtime);
     int sampwin = static_cast<int>(fs * timewin);
     int ntwin = static_cast<int>(p_filt_input.size() / sampwin);
 
-    if (ntwin == 0) {
-        throw runtime_error("Not enough data for even one time window.");
+    if (ntwin == 0) { // Invalid time window
+        throw runtime_error("Empty time window.");
     }
     
     // Truncate p_filt to exact multiple of sampwin
     vector<double> p_filt(p_filt_input.begin(), p_filt_input.begin() + sampwin * ntwin);
     
-    // Reshape p_filt into a 2D structure (sampwin x ntwin)
+    // Reshape p_filt into 2D structure (sampwin x ntwin)
     vector<vector<double>> p_filt_reshaped(ntwin, vector<double>(sampwin));
     for (int j = 0; j < ntwin; j++) {
         for (int i = 0; i < sampwin; i++) {
@@ -446,7 +434,7 @@ SoloPerGM2Result f_solo_per_GM2(
         p_av.push_back(p_avi);
     }
     
-    // Convert p_av to p_avtot (flatten to a 1D vector)
+    // Flatten p_av to 1D vector
     for (int i = 0; i < p_av.size(); i++) {
         const auto& row = p_av[i];
         p_avtot.insert(p_avtot.end(), row.begin(), row.end());
@@ -470,11 +458,39 @@ SoloPerGM2Result f_solo_per_GM2(
         
         // Find peaks
         int peak_count = 0;
+        
+        // Skip first and last indices as they cannot be peaks
         for (int i = 1; i < acorr[zz].size() - 1; i++) {
-            // Simple peak detection: higher than neighbors and prominence > 0.5
+            // Check if this point is higher than its immediate neighbors
             if (acorr[zz][i] > acorr[zz][i-1] && acorr[zz][i] > acorr[zz][i+1]) {
-                double prominence = min(acorr[zz][i] - acorr[zz][i-1], acorr[zz][i] - acorr[zz][i+1]);
-                if (prominence > 0.5) {
+                // Now calculate prominence properly 
+                // Look left for nearest higher or equal point
+                double left_min = acorr[zz][i];
+                for (int j = i-1; j >= 0; j--) {
+                    if (acorr[zz][j] >= acorr[zz][i]) {
+                        break;  // Found higher or equal point
+                    }
+                    left_min = min(left_min, acorr[zz][j]);
+                }
+                
+                // Look right for nearest higher or equal point
+                double right_min = acorr[zz][i];
+                for (int j = i+1; j < acorr[zz].size(); j++) {
+                    if (acorr[zz][j] >= acorr[zz][i]) {
+                        break; // Found higher or equal point
+                    }
+                    right_min = min(right_min, acorr[zz][j]);
+                }
+                
+                // Calculate prominence as difference between peak and highest minimum
+                double prominence = acorr[zz][i] - max(left_min, right_min);
+                
+                // Use relative threshold based on the max value in the autocorrelation
+                double max_autocorr = *max_element(acorr[zz].begin(), acorr[zz].end());
+                double threshold = 0.5;  // 50% of max value
+                
+                // Count peak if prominent enough
+                if (prominence > threshold) {
                     peak_count++;
                 }
             }
@@ -484,7 +500,7 @@ SoloPerGM2Result f_solo_per_GM2(
     }
     
     // Create and return a struct
-    SoloPerGM2Result result;
+    SoloPerGM2 result;
     result.peakcount = pkcount;
     result.autocorr = acorr;
     
@@ -499,7 +515,7 @@ vector<complex<double>> hilbert(const vector<double>& xr, int n = -1) {
 
     // Prepare FFT input with zero-padding or truncation
     double* in = (double*)fftw_malloc(sizeof(double) * n);
-    fill(in, in + n, 0.0);  // Zero-initialize
+    fill(in, in + n, 0.0); // Zero-initialize
 
     int copyLen = min(static_cast<int>(xr.size()), n);
     for (int i = 0; i < copyLen; ++i) {
@@ -551,28 +567,32 @@ vector<complex<double>> hilbert(const vector<double>& xr, int n = -1) {
     return x;
 }
 
-void processAnalyticSignal(const vector<complex<double>>& analytic1,
-    vector<double>& at1) {
-    at1.resize(analytic1.size());
+void processAnalyticSignal(const vector<complex<double>>& analytic1, vector<double>& at1) {
+    size_t n = analytic1.size();
+    at1.resize(n);
 
-    vector<double> abs_analytic1(analytic1.size());
-    transform(analytic1.begin(), analytic1.end(), abs_analytic1.begin(),
-        [](const complex<double>& val) { return abs(val); });
+    vector<double> abs_analytic1(n);
+    double sum_abs = 0.0;
 
-        double sum_abs = 0.0;
-        for (int i = 0; i < abs_analytic1.size(); i++) {
-            sum_abs += abs_analytic1[i];
-        }
+    // Compute magnitude / sum
+    for (size_t i = 0; i < n; ++i) {
+        abs_analytic1[i] = abs(analytic1[i]);
+        sum_abs += abs_analytic1[i];
+    }
 
+    // Normalize or fill with zeros
     if (sum_abs != 0.0) {
-        transform(abs_analytic1.begin(), abs_analytic1.end(), at1.begin(),
-            [sum_abs](double val) { return val / sum_abs; });
+        for (size_t i = 0; i < n; ++i) {
+            at1[i] = abs_analytic1[i] / sum_abs;
+        }
     } else {
-        fill(at1.begin(), at1.end(), 0.0);
+        for (size_t i = 0; i < n; ++i) {
+            at1[i] = 0.0;
+        }
     }
 }
 
-// Function to calculate the sum of all elements in a vector
+// Calculate the sum of all elements in a vector
 double sumVector(const vector<double>& vec) {
     double sum = 0.0;
     for (int i = 0; i < vec.size(); i++) {
@@ -581,7 +601,7 @@ double sumVector(const vector<double>& vec) {
     return sum;
 }
 
-// Function to calculate the absolute value of each element in a vector
+// Calculate absolute value of each element in vector
 vector<double> absVector(const vector<complex<double>>& vec) {
     vector<double> result(vec.size());
 
@@ -597,7 +617,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
     int numfftwin = pts_per_timewin / pts_per_fft;  // # of fft windows
     vector<double> Dfin;
 
-    // Allocate FFTW memory outside the loop
+    // Allocate FFTW memory outside loop
     fftw_complex* in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * pts_per_fft);
     fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * pts_per_fft);
     fftw_plan p = fftw_plan_dft_1d(pts_per_fft, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
@@ -610,7 +630,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
         vector<double> col1(timechunk_matrix.size());
         vector<double> col2(timechunk_matrix.size());
 
-        // Get analytic signals for current and next time chunks
+        // Get analytic signals for current / next time chunks
         vector<complex<double>> analytic1 = hilbert(timechunk_matrix[kk], timechunk_matrix[kk].size());
         vector<complex<double>> analytic2 = hilbert(timechunk_matrix[kk + 1], timechunk_matrix[kk + 1].size());
 
@@ -620,7 +640,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
         processAnalyticSignal(analytic1, at1);
         processAnalyticSignal(analytic2, at2);
 
-        // Calculate Dt (difference in analytic signals)
+        // Calculate difference in analytic signals (Dt)
         vector<double> diff(at1.size());
         for (int i = 0; i < at1.size(); i++) {
             diff[i] = abs(at1[i] - at2[i]);
@@ -658,7 +678,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
             sfa[i] = sum / numfftwin;
         }
 
-        // Normalize the FFT results
+        // Normalize FFT results
         vector<double> Sfa(pts_per_fft);
         double sum_Sfa = 0;
         for (int i = 0; i < pts_per_fft; i++) {
@@ -670,7 +690,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
             Sfa[i] /= sum_Sfa;
         }
 
-        // Reset and repeat for next time chunk
+        // Reset / repeat for next time chunk
         vector<double> s3b(pts_per_fft * numfftwin);
         for (int i = 0; i < pts_per_fft * numfftwin; i++) {
             s3b[i] = timechunk_matrix[kk + 1][i];
@@ -702,7 +722,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
             sfb[i] = sum / numfftwin;
         }
 
-        // Normalize the FFT results for s3b
+        // Normalize FFT results for s3b
         vector<double> Sfb(pts_per_fft);
         double sum_Sfb = 0;
         for (int i = 0; i < pts_per_fft; i++) {
@@ -714,7 +734,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
             Sfb[i] /= sum_Sfb;
         }
 
-        // Compute the dissimilarity (Df)
+        // Compute dissimilarity (Df)
         double Df = 0;
         for (int i = 0; i < pts_per_fft; i++) {
             Df += abs(Sfb[i] - Sfa[i]);
@@ -734,31 +754,7 @@ vector<double> f_solo_dissim_GM1(const vector<vector<double>>& timechunk_matrix,
     return Dfin;
 }
 
-vector<double> audioread(const string& filename, int& sampleRate) {
-    SF_INFO sfinfo = {};
-    SNDFILE* file = sf_open(filename.c_str(), SFM_READ, &sfinfo);
-    if (!file) {
-        throw runtime_error("Error opening file: " + string(sf_strerror(nullptr)));
-    }
-
-    sampleRate = sfinfo.samplerate;
-    int numChannels = sfinfo.channels;
-    int numFrames = sfinfo.frames;
-
-    vector<double> interleaved(numFrames * numChannels);
-    sf_readf_double(file, interleaved.data(), numFrames);
-    sf_close(file);
-
-    // Extract first channel
-    vector<double> channelData(numFrames);
-    for (int i = 0; i < numFrames; ++i) {
-        channelData[i] = interleaved[i * numChannels]; // first channel only
-    }
-
-    return channelData;
-}
-
-// Function to compute RMS (Root Mean Square) of a vector
+// Function to compute Root Mean Square of vector
 double rms(const vector<double>& x) {
     if (x.empty()) {
         throw invalid_argument("Input vector is empty.");
@@ -772,7 +768,7 @@ double rms(const vector<double>& x) {
     return sqrt(sumSquares / x.size());
 }
 
-// Overloaded function to compute RMS for a 2D matrix
+// Overloaded function to compute RMS for 2D matrices
 vector<double> rms(const vector<vector<double>>& matrix) {
     if (matrix.empty()) {
         throw invalid_argument("Input matrix is empty.");
@@ -797,7 +793,7 @@ vector<double> calculateSPLpkhold(const vector<vector<double>>& timechunk_matrix
             maxVal = max(maxVal, abs(val));
         }
 
-        // Avoid log(0) by using a small epsilon floor
+        // Avoid log(0) by using small epsilon floor
         const double epsilon = 1e-12;
         maxVal = max(maxVal, epsilon);
         
@@ -809,28 +805,47 @@ vector<double> calculateSPLpkhold(const vector<vector<double>>& timechunk_matrix
 
 AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const filesystem::directory_entry &file_name,
     double RS, int timewin, double avtime, int fft_win, int arti, int flow, int fhigh) {
-    // Initialize output variables as cell arrays
+    // Initialize output variables as vectors
     vector<double> SPLrms, SPLpk, impulsivity, autocorr, dissim;
     vector<int> peakcount;
 
-    // Convert and fix the file path
+    // Convert file path to follow correct notation
     string file_path = fixFilePath(file_name.path().string());
 
     AudioFeatures features;
     double rs = pow(10, RS / 20.0);
+    // cout << "rs: " << rs << endl;
     double max_count = pow(2, num_bits);
+    // cout << "max_count: " << max_count << endl;
     double conv_factor = peak_volts / max_count;
+    // cout << "conv_factor: " << conv_factor << endl;
 
     AudioInfo info = audioread_info(file_path);
-    vector<double> audioDataA = audioread(file_name.path().string(), info.sampleRate);
 
     int total_samples = info.sampleRate * info.duration;
 
     // Call audioread with dynamic range
-    auto audio = audioread(file_path, SampleRange{1, total_samples}, "double");
+    auto audio = audioread(file_path, SampleRange{1, total_samples});
+    // Display basic info
+    // cout << "Sample rate: " << audio.sampleRate << endl;
+    // cout << "Number of channels: " << audio.samples.size() << endl;
+    // cout << "Number of samples in first channel: " << audio.samples[0].size() << endl;
+
+    // Display the first 10 samples of each channel (or fewer if short)
+    // int num_to_display = min(size_t(10), audio.samples[0].size());
+    // for (int ch = 0; ch < audio.samples.size(); ++ch) {
+    //     cout << "Channel " << ch + 1 << " last samples: ";
+    //     for (int i = audio.samples[ch].size() - num_to_display; i < audio.samples[ch].size(); ++i) {
+    //         cout << audio.samples[ch][i] << " ";
+    //     }
+    //     cout << endl;
+    // }
 
     int fs = audio.sampleRate;
+    // cout << "fs: " << fs << endl;
     vector<double> x = audio.samples[0];
+    // cout << "x[0]: " << x[0] << endl;
+    // cout << "x[end]: " << x[x.size() - 1] << endl;
 
     // Downsample or upsample as necessary
     if (fs == 576000) {
@@ -858,41 +873,61 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
             x[i] = static_cast<double>(temp);
         }
     }
+    // cout << x[0] << endl;
+    // cout << x[1] << endl;
+    // cout << x[2] << endl;
 
     // Calibration tone processing (if applicable)
     vector<double> voltage(x.size());
     vector<double> pressure(x.size());
     
-    transform(
-        x.begin(), x.end(), voltage.begin(),
-        [conv_factor](double sample) {
-            return sample * conv_factor;
-        }
-    );
+    // Convert raw samples into voltage units by scaling
+    for (size_t i = 0; i < x.size(); ++i) {
+        voltage[i] = x[i] * conv_factor;
+    }
+    // Print length and first 3 values of voltage
+    // cout << "voltage size: " << voltage.size() << endl;
+    // cout << "First 3 voltage values: ";
+    // for (size_t i = 0; i < min(size_t(3), voltage.size()); ++i) {
+    //     cout << voltage[i] << " ";
+    // }
+    // cout << endl;
     
-    transform(
-        voltage.begin(), voltage.end(), pressure.begin(),
-        [rs](double sample) {
-            return sample / rs;
-        }
-    );
+    // Convert raw samples into pressure units by scaling
+    for (size_t i = 0; i < voltage.size(); ++i) {
+        pressure[i] = voltage[i] / rs;
+    }
 
-    if (arti == 1) {
+    // cout << "v[0:2]: " << voltage[0] << " " << voltage[1] << " " << voltage[2] << endl;
+
+    if (arti == 1) { // Calibration tone is present
         int start_idx = 6 * fs;
         pressure = vector<double>(pressure.begin() + start_idx, pressure.end());
         pressure.insert(pressure.begin(), 0);
     }
 
     // Bandpass filtering
-    auto [p_filt, filtspec1] = dylan_bpfilt(pressure, 1.0 / fs, flow, fhigh);
+    auto [p_filt, _] = dylan_bpfilt(pressure, 1.0 / fs, flow, fhigh);
+    // cout << "p_filt size: " << p_filt.size() << endl;
+    // cout << "p_filt[0:2]: " << p_filt[0] << " " <<  p_filt[1] << " " <<  p_filt[2] << endl;
+    // cout << "p_filt[end-2:end]: " << p_filt[p_filt.size() - 3] << " " <<  p_filt[p_filt.size() - 2] << " " <<  p_filt[p_filt.size()-1] << endl;
 
     int pts_per_timewin = timewin * fs;
+    // cout << pts_per_timewin << endl;
     int num_timewin = floor(p_filt.size() / pts_per_timewin) + 1;
+    // cout << num_timewin << endl;
     int padding_length = num_timewin * pts_per_timewin - p_filt.size();
+    // cout << padding_length << endl;
 
     // Efficient padding using resize
     vector<double> p_filt_padded(p_filt);
     p_filt_padded.resize(p_filt.size() + padding_length, 0.0);
+    // for (int i = 0; i < 3; i++) {
+    //     cout << "pfp: " << p_filt_padded[i] << endl;
+    // }
+    // for (int i = p_filt_padded.size() - 3; i < p_filt_padded.size(); i++) {
+    //     cout << "pfp: " << p_filt_padded[i] << endl;
+    // }
 
     vector<vector<double>> timechunk_matrix(num_timewin, vector<double>(pts_per_timewin));
     for (int i = 0; i < num_timewin; i++) {
@@ -901,20 +936,49 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
         }
     }
 
+    // Display timechunk_matrix dimensions
+    // cout << "tcm size: " << timechunk_matrix.size() << " x " << (timechunk_matrix.empty() ? 0 : timechunk_matrix[0].size()) << endl;
+
+    // Print first row
+    // if (!timechunk_matrix.empty() && !timechunk_matrix[0].empty()) {
+    //     size_t numRows = timechunk_matrix.size();
+    //     size_t numCols = timechunk_matrix[0].size();
+
+    //     cout << "tcm first column: ";
+    //     for (size_t i = 0; i < numRows; ++i) {
+    //         cout << timechunk_matrix[i][0] << " ";
+    //     }
+    //     cout << endl;
+
+    //     cout << "tcm last column: ";
+    //     for (size_t i = 0; i < numRows; ++i) {
+    //         cout << timechunk_matrix[i][numCols - 1] << " ";
+    //     }
+    //     cout << endl;
+    // }
+
     // Calculate features
     int spl_len = 0;
-    double* spl_array = computeSPL(rms(timechunk_matrix), spl_len);
-    features.SPLrms = vector<double>(spl_array, spl_array + spl_len);
-    delete[] spl_array;
+
+    double* rms_matrix = computeSPL(rms(timechunk_matrix), spl_len);
+    // if (spl_len > 0) {
+    //     cout << "rms_matrix (first): " << rms_matrix[0] << endl;
+    //     cout << "..." << endl;
+    //     cout << "rms_matrix (last): " << rms_matrix[spl_len - 1] << endl;
+    // } else {
+    //     cout << "rms_matrix is empty." << endl;
+    // }
+    features.SPLrms = vector<double>(rms_matrix, rms_matrix + spl_len);
+    delete[] rms_matrix;
     features.SPLpk = calculateSPLpkhold(timechunk_matrix);
 
-    vector<double> kmat(timechunk_matrix.size(), 0.0);
+    vector<double> kurtosis_matrix(timechunk_matrix.size(), 0.0);
     for (int row = 0; row < timechunk_matrix.size(); ++row) {
-        kmat[row] = calculate_kurtosis(timechunk_matrix[row]);
+        kurtosis_matrix[row] = calculate_kurtosis(timechunk_matrix[row]);
     }
-    features.impulsivity = kmat;
+    features.impulsivity = kurtosis_matrix;
 
-    SoloPerGM2Result result = f_solo_per_GM2(p_filt_padded, fs, timewin, avtime);
+    SoloPerGM2 result = f_solo_per_GM2(p_filt_padded, fs, timewin, avtime);
     features.peakcount = result.peakcount;
     features.autocorr = result.autocorr;
 
@@ -923,19 +987,18 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
     return features;
 }
 
-// Helper function to save features to a CSV file
-void saveFeaturesToCSV(const string& filename, const vector<string>& filenames, 
-    const vector<AudioFeatures>& allFeatures) {
+// Export saved features to CSV file
+void saveFeaturesToCSV(const string& filename, const vector<string>& filenames, const vector<AudioFeatures>& allFeatures) {
     
-    // Debug: Print number of files and features
-    cout << "Number of files: " << filenames.size() << endl;
-    for (int i = 0; i < allFeatures.size(); ++i) {
-        cout << "File " << filenames[i] << " SPLrms size: " << allFeatures[i].SPLrms.size() << endl;
-    }
+    // Display number of files / features
+    // cout << "Number of files: " << filenames.size() << endl;
+    // for (int i = 0; i < allFeatures.size(); ++i) {
+    //     cout << "File " << filenames[i] << " SPLrms size: " << allFeatures[i].SPLrms.size() << endl;
+    // }
 
     // Open file in write mode (not append)
     ofstream outputFile(filename);
-    if (!outputFile.is_open()) {
+    if (!outputFile.is_open()) { // Error opening output file
         cerr << "Error: Unable to open output file: " << filename << endl;
         return;
     }
@@ -949,9 +1012,9 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
     for (int i = 0; i < static_cast<int>(allFeatures.size()); ++i) {
         const auto& feature = allFeatures[i];
         if (!feature.autocorr.empty()) {
-            maxAutocorrRows = std::max(maxAutocorrRows, static_cast<int>(feature.autocorr.size()));
+            maxAutocorrRows = max(maxAutocorrRows, static_cast<int>(feature.autocorr.size()));
             if (!feature.autocorr[0].empty()) {
-                maxAutocorrCols = std::max(maxAutocorrCols, static_cast<int>(feature.autocorr[0].size()));
+                maxAutocorrCols = max(maxAutocorrCols, static_cast<int>(feature.autocorr[0].size()));
             }
         }
     }
@@ -967,12 +1030,12 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
     }
     outputFile << endl;
 
-    // Process each file's features
+    // Process features for each file
     for (int fileIdx = 0; fileIdx < static_cast<int>(allFeatures.size()); ++fileIdx) {
         const AudioFeatures& features = allFeatures[fileIdx];
 
-        // Determine maximum length among all feature vectors
-        int maxLength = std::max({
+        // Determine maximum length of all feature vectors
+        int maxLength = max({
             static_cast<int>(features.SPLrms.size()),
             static_cast<int>(features.SPLpk.size()),
             static_cast<int>(features.impulsivity.size()),
@@ -984,33 +1047,33 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
         for (int i = 0; i < maxLength; ++i) {
             outputFile << filenames[fileIdx] << ",";
 
-            if (i < features.SPLrms.size()) {
+            if (i < features.SPLrms.size()) { // SPLrms
                 outputFile << to_string(features.SPLrms[i]) << ",";
             } else {
                 outputFile << "nan,";
             }
-            if (i < features.SPLpk.size()) {
+            if (i < features.SPLpk.size()) { // SPLpk
                 outputFile << to_string(features.SPLpk[i]) << ",";
             } else {
                 outputFile << "nan,";
             }
-            if (i < features.impulsivity.size()) {
+            if (i < features.impulsivity.size()) { // Impulsivity
                 outputFile << to_string(features.impulsivity[i]) << ",";
             } else {
                 outputFile << "nan,";
             }
-            if (i < features.dissim.size()) {
+            if (i < features.dissim.size()) { // Dissimilarity
                 outputFile << to_string(features.dissim[i]) << ",";
             } else {
                 outputFile << "nan,";
             }
-            if (i < features.peakcount.size()) {
+            if (i < features.peakcount.size()) { // Peakcount
                 outputFile << to_string(features.peakcount[i]) << ",";
             } else {
                 outputFile << "nan,";
             }
             // Autocorrelation handling
-            if (i < features.autocorr.size()) {
+            if (i < features.autocorr.size()) { // Autocorellation
                 for (int j = 0; j < maxAutocorrCols; ++j) {
                     if (j < features.autocorr[i].size()) {
                         outputFile << to_string(features.autocorr[i][j]);
@@ -1034,11 +1097,12 @@ void saveFeaturesToCSV(const string& filename, const vector<string>& filenames,
         }
     }
 
-    cout << "Features saved to: " << filename << endl;
+    cout << "Features saved to: " << filename << endl; // Display successful save of features
 }
 
 int main(int argc, char* argv[]) {
     // Parameters provided by user using command line arguments
+    // Default values if unspecified
     string input_dir;
     string output_file;
     int num_bits = 16;
@@ -1050,7 +1114,7 @@ int main(int argc, char* argv[]) {
     double avtime = 0.1;
     int flow = 1;
     int fhigh = 192000;
-    unsigned int max_threads = 4; // Default thread cap
+    unsigned int max_threads = 4;
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -1084,19 +1148,19 @@ int main(int argc, char* argv[]) {
     }
 
     // Display parameters
-    cout << "Running with parameters:" << endl;
-    cout << "  Input directory: " << input_dir << endl;
-    cout << "  Output file: " << output_file << endl;
-    cout << "  Number of bits: " << num_bits << endl;
-    cout << "  RS: " << RS << endl;
-    cout << "  Peak volts: " << peak_volts << endl;
-    cout << "  Arti: " << arti << endl;
-    cout << "  Time window: " << timewin << endl;
-    cout << "  FFT window: " << fft_win << endl;
-    cout << "  Average time: " << avtime << endl;
-    cout << "  Flow frequency: " << flow << endl;
-    cout << "  High frequency: " << fhigh << endl;
-    cout << "  Max threads: " << max_threads << endl;
+    // cout << "Running with parameters:" << endl;
+    // cout << "  Input directory: " << input_dir << endl;
+    // cout << "  Output file: " << output_file << endl;
+    // cout << "  Number of bits: " << num_bits << endl;
+    // cout << "  RS: " << RS << endl;
+    // cout << "  Peak volts: " << peak_volts << endl;
+    // cout << "  Arti: " << arti << endl;
+    // cout << "  Time window: " << timewin << endl;
+    // cout << "  FFT window: " << fft_win << endl;
+    // cout << "  Average time: " << avtime << endl;
+    // cout << "  Flow frequency: " << flow << endl;
+    // cout << "  High frequency: " << fhigh << endl;
+    // cout << "  Max threads: " << max_threads << endl;
 
     vector<AudioFeatures> allFeatures;
     vector<string> filenames;
@@ -1128,7 +1192,7 @@ int main(int argc, char* argv[]) {
             }
 
             try {
-                cout << "Processing: " << file.path().filename() << endl;
+                // cout << "Processing: " << file.path().filename() << endl;
                 AudioFeatures features = f_WAV_frankenfunction_reilly(
                     num_bits, peak_volts, file, RS, timewin, avtime, fft_win, arti, flow, fhigh);
 
