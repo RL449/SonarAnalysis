@@ -70,7 +70,7 @@ struct ArrayShiftFFT {
     double* data;
     int length;
 
-    ~ArrayShiftFFT() {
+    ~ArrayShiftFFT() { // Destructor
         delete[] data;
     }
 };
@@ -804,7 +804,7 @@ vector<double> calculateSPLpkhold(const vector<vector<double>>& timechunk_matrix
 }
 
 AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const filesystem::directory_entry &file_name,
-    double RS, int timewin, double avtime, int fft_win, int arti, int flow, int fhigh) {
+    double RS, int timewin, double avtime, int fft_win, int arti, int flow, int fhigh, int downsample_factor) {
     // Initialize output variables as vectors
     vector<double> SPLrms, SPLpk, impulsivity, autocorr, dissim;
     vector<int> peakcount;
@@ -847,23 +847,28 @@ AudioFeatures f_WAV_frankenfunction_reilly(int num_bits, int peak_volts, const f
     // cout << "x[0]: " << x[0] << endl;
     // cout << "x[end]: " << x[x.size() - 1] << endl;
 
-    // Downsample or upsample as necessary
-    if (fs == 576000) {
-        x = downsample(x, 4);
-        fs /= 4;
-    } else if (fs == 288000) {
-        x = downsample(x, 2);
-        fs /= 2;
-    } else if (fs == 16000) {
-        x = upsample(x, 9);
-        fs *= 9;
-    } else if (fs == 8000) {
-        x = upsample(x, 18);
-        fs *= 18;
-    } else if (fs == 512000) {
-        x = downsample(x, 4);
-        fs = static_cast<int>(fs / 3.5555555555555555555);
+    // Downsample if specified
+    if (downsample_factor != -1) {
+        x = downsample(x, downsample_factor);
+        fs /= downsample_factor;
     }
+    
+    // if (fs == 576000) {
+    //     x = downsample(x, 4);
+    //     fs /= 4;
+    // } else if (fs == 288000) {
+    //     x = downsample(x, 2);
+    //     fs /= 2;
+    // } else if (fs == 16000) {
+    //     x = upsample(x, 9);
+    //     fs *= 9;
+    // } else if (fs == 8000) {
+    //     x = upsample(x, 18);
+    //     fs *= 18;
+    // } else if (fs == 512000) {
+    //     x = downsample(x, 4);
+    //     fs = static_cast<int>(fs / 3.5555555555555555555);
+    // }
 
     // Adjust for 24-bit audio
     if (num_bits == 24) {
@@ -1115,6 +1120,7 @@ int main(int argc, char* argv[]) {
     int flow = 1;
     int fhigh = 192000;
     unsigned int max_threads = 4;
+    int downsample = -1;
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -1144,6 +1150,8 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) fhigh = stoi(argv[++i]);
         } else if (arg == "--max_threads" || arg == "-mt") {
             if (i + 1 < argc) max_threads = stoi(argv[++i]);
+        } else if (arg == "--downsample" || arg == "-ds") {
+            if (i + 1 < argc) downsample = stoi(argv[++i]);
         }
     }
 
@@ -1194,7 +1202,7 @@ int main(int argc, char* argv[]) {
             try {
                 // cout << "Processing: " << file.path().filename() << endl;
                 AudioFeatures features = f_WAV_frankenfunction_reilly(
-                    num_bits, peak_volts, file, RS, timewin, avtime, fft_win, arti, flow, fhigh);
+                    num_bits, peak_volts, file, RS, timewin, avtime, fft_win, arti, flow, fhigh, downsample);
 
                 lock_guard<mutex> lock(mtx);
                 allFeatures.push_back(move(features));
