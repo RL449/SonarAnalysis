@@ -41,3 +41,6 @@ g++ -o main_original.exe main_original.cpp -IC:\path\to\fftw3.h\and\sndfile.h -L
 
 Run program:
 main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\output\directory\output_filename.csv" --num_bits # --RS -# --peak_volts # --arti # --timewin # --fft_win # --avtime # --flow # --fhigh # --max_threads # --omit_partial_minute (optional)
+
+This is fully compatible with gcc version 11.4.0 and partially compatible with gcc version 14.2.0.
+
