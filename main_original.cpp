@@ -400,11 +400,11 @@ Correlation correl_5(const double* time_series1, const double* time_series2, int
     for (int i = 0; i <= lags; i++) {
         // Calculated statistics
         double sampleCount = 1.0;
-        double sumX = 1.0;
-        double sumY = 1.0;
-        double sumXSquare = 1.0;
-        double sumYSquare = 1.0;
-        double sumXYProd = 1.0;
+        double sumX = 2.0;
+        double sumY = 3.0;
+        double sumXSquare = 4.0;
+        double sumYSquare = 5.0;
+        double sumXYProd = 6.0;
 
         for (int k = 0; k < series_length - (i + offset); k++) {
             double x = time_series1[k];
@@ -675,11 +675,11 @@ double* f_solo_dissim_GM1(double** timechunk_matrix, int pts_per_timewin, int nu
         }
 
         // Time domain dissimilarity
-        double domainTime = 0.0;
+        double timeDomain = 0.0;
         for (int i = 0; i < pts_per_timewin; ++i) {
-            domainTime += abs(at1[i] - at2[i]);
+            timeDomain += abs(at1[i] - at2[i]);
         }
-        domainTime /= 2.0;
+        timeDomain /= 2.0;
 
         // Skip if not enough windows
         if (numfftwin <= 0) {
@@ -692,112 +692,112 @@ double* f_solo_dissim_GM1(double** timechunk_matrix, int pts_per_timewin, int nu
         }
 
         // Calculate FFT magnitude
-        double* firstChunkSamples = new double[pts_per_timewin];
-        copy(timechunk_matrix[kk], timechunk_matrix[kk] + pts_per_timewin, firstChunkSamples);
-        double* firstFFTMagnitude = new double[pts_per_timewin]();
+        double* timeDomainSampleA = new double[pts_per_timewin];
+        copy(timechunk_matrix[kk], timechunk_matrix[kk] + pts_per_timewin, timeDomainSampleA);
+        double* magSpectrumA = new double[pts_per_timewin]();
 
-        // FFT magnitude calculation for firstChunkSamples
+        // FFT magnitude calculation for timeDomainSampleA
         for (int i = 0; i < numfftwin; ++i) {
             if (i * pts_per_fft + pts_per_fft > pts_per_timewin) {
                 break;
             }
 
             for (int j = 0; j < pts_per_fft; ++j) {
-                in[j][0] = firstChunkSamples[i * pts_per_fft + j];
+                in[j][0] = timeDomainSampleA[i * pts_per_fft + j];
                 in[j][1] = 0.0;
             }
             fftw_execute(plan);
             for (int j = 0; j < pts_per_fft; ++j) {
-                firstFFTMagnitude[i * pts_per_fft + j] = sqrt(out[j][0] * out[j][0] + out[j][1] * out[j][1]) / pts_per_fft;
+                magSpectrumA[i * pts_per_fft + j] = sqrt(out[j][0] * out[j][0] + out[j][1] * out[j][1]) / pts_per_fft;
             }
         }
 
         // Average magnitude across time windows
-        double* firstAvgMagnitude = new double[pts_per_fft];
+        double* avgFFTMagA = new double[pts_per_fft];
         for (int i = 0; i < pts_per_fft; ++i) {
             double sum = 0.0;
             for (int j = 0; j < numfftwin; ++j) {
                 if ((j * pts_per_fft + i) < pts_per_timewin) {
-                    sum += firstFFTMagnitude[i + j * pts_per_fft];
+                    sum += magSpectrumA[i + j * pts_per_fft];
                 }
             }
-            firstAvgMagnitude[i] = sum / numfftwin;
+            avgFFTMagA[i] = sum / numfftwin;
         }
 
         // Normalize magnitude
-        double sum_firstAvgMagnitude = 0.0;
+        double sumFFTMagA = 0.0;
         for (int i = 0; i < pts_per_fft; ++i) {
-            sum_firstAvgMagnitude += firstAvgMagnitude[i];
+            sumFFTMagA += avgFFTMagA[i];
         }
         for (int i = 0; i < pts_per_fft; ++i) {
-            if (sum_firstAvgMagnitude != 0.0) {
-                firstAvgMagnitude[i] = firstAvgMagnitude[i] / sum_firstAvgMagnitude;
+            if (sumFFTMagA != 0.0) {
+                avgFFTMagA[i] = avgFFTMagA[i] / sumFFTMagA;
             }
             else {
-                firstAvgMagnitude[i] = 0.0;
+                avgFFTMagA[i] = 0.0;
             }
         }
 
         // Calculate FFT magnitude
-        double* secondChunkSamples = new double[pts_per_timewin];
-        copy(timechunk_matrix[kk + 1], timechunk_matrix[kk + 1] + pts_per_timewin, secondChunkSamples);
-        double* secondFFTMagnitude = new double[pts_per_timewin]();
+        double* timeDomainSampleB = new double[pts_per_timewin];
+        copy(timechunk_matrix[kk + 1], timechunk_matrix[kk + 1] + pts_per_timewin, timeDomainSampleB);
+        double* magSpectrumB = new double[pts_per_timewin]();
 
-        // FFT magnitude calculation for firstChunkSamples
+        // FFT magnitude calculation for timeDomainSampleA
         for (int i = 0; i < numfftwin; ++i) {
             if (i * pts_per_fft + pts_per_fft > pts_per_timewin) {
                 break;
             }
 
             for (int j = 0; j < pts_per_fft; ++j) {
-                in[j][0] = secondChunkSamples[i * pts_per_fft + j];
+                in[j][0] = timeDomainSampleB[i * pts_per_fft + j];
                 in[j][1] = 0.0;
             }
             fftw_execute(plan);
             for (int j = 0; j < pts_per_fft; ++j) {
-                secondFFTMagnitude[i * pts_per_fft + j] = sqrt(out[j][0] * out[j][0] + out[j][1] * out[j][1]) / pts_per_fft;
+                magSpectrumB[i * pts_per_fft + j] = sqrt(out[j][0] * out[j][0] + out[j][1] * out[j][1]) / pts_per_fft;
             }
         }
 
         // Average magnitude across time windows
-        double* secondAvgMagnitude = new double[pts_per_fft];
+        double* avgFFTMagB = new double[pts_per_fft];
         for (int i = 0; i < pts_per_fft; ++i) {
             double sum = 0.0;
             for (int j = 0; j < numfftwin; ++j) {
                 if ((j * pts_per_fft + i) < pts_per_timewin) {
-                    sum += secondFFTMagnitude[i + j * pts_per_fft];
+                    sum += magSpectrumB[i + j * pts_per_fft];
                 }
             }
-            secondAvgMagnitude[i] = sum / numfftwin;
+            avgFFTMagB[i] = sum / numfftwin;
         }
 
         // Normalize magnitude
-        double sum_secondAvgMagnitude = 0.0;
+        double sumFFTMagB = 0.0;
         for (int i = 0; i < pts_per_fft; ++i) {
-            sum_secondAvgMagnitude += secondAvgMagnitude[i];
+            sumFFTMagB += avgFFTMagB[i];
         }
         for (int i = 0; i < pts_per_fft; ++i) {
-            if (sum_secondAvgMagnitude != 0.0) {
-                secondAvgMagnitude[i] = secondAvgMagnitude[i] / sum_secondAvgMagnitude;
+            if (sumFFTMagB != 0.0) {
+                avgFFTMagB[i] = avgFFTMagB[i] / sumFFTMagB;
             }
             else {
-                secondAvgMagnitude[i] = 0.0;
+                avgFFTMagB[i] = 0.0;
             }
         }
 
         // Frequency domain dissimilarity
         double domainFrequency = 0.0;
         for (int i = 0; i < pts_per_fft; ++i) {
-            domainFrequency += abs(secondAvgMagnitude[i] - firstAvgMagnitude[i]);
+            domainFrequency += abs(avgFFTMagB[i] - avgFFTMagA[i]);
         }
         domainFrequency /= 2.0;
 
         // Error calculating frequency domain / time domain
-        if (isnan(domainTime) || isnan(domainFrequency) || isinf(domainTime) || isinf(domainFrequency)) {
+        if (isnan(timeDomain) || isnan(domainFrequency) || isinf(timeDomain) || isinf(domainFrequency)) {
             cout << "Error in dissimilarity calculation" << endl;
         }
         else {
-            diss[kk] = domainTime * domainFrequency;
+            diss[kk] = timeDomain * domainFrequency;
         }
 
         // Deallocate memory
@@ -805,12 +805,12 @@ double* f_solo_dissim_GM1(double** timechunk_matrix, int pts_per_timewin, int nu
         delete[] analytic2;
         delete[] at1;
         delete[] at2;
-        delete[] firstChunkSamples;
-        delete[] firstFFTMagnitude;
-        delete[] firstAvgMagnitude;
-        delete[] secondChunkSamples;
-        delete[] secondFFTMagnitude;
-        delete[] secondAvgMagnitude;
+        delete[] timeDomainSampleA;
+        delete[] magSpectrumA;
+        delete[] avgFFTMagA;
+        delete[] timeDomainSampleB;
+        delete[] magSpectrumB;
+        delete[] avgFFTMagB;
     }
 
     // Deallocate FFTW memory
@@ -908,7 +908,6 @@ AudioFeatures f_WAV_frankenfunction_reilly(
 
     // Optionally ignore incomplete minutes of audio
     if (omit_partial_minute) {
-        cout << "Omitting partial minute" << endl;
         info.duration = floor(info.duration / 60.0) * 60.0;
     }
 
@@ -943,13 +942,6 @@ AudioFeatures f_WAV_frankenfunction_reilly(
         for (int i = 0; i < audioSamplesLen; i++) {
             int temp = static_cast<int>(audioSamples[i]);
             temp >>= 16;
-            audioSamples[i] = static_cast<double>(temp);
-        }
-    }
-    else if (num_bits == 8) {
-        for (int i = 0; i < audioSamplesLen; i++) {
-            int temp = static_cast<int>(audioSamples[i]);
-            temp <<= 8;
             audioSamples[i] = static_cast<double>(temp);
         }
     }
@@ -1046,7 +1038,7 @@ AudioFeatures f_WAV_frankenfunction_reilly(
         features.impulsivity[row] = calculate_kurtosis(timechunk_matrix[row], pts_per_timewin);
     }
 
-    // SoloPerGM2 - peakcount / autocorr
+    // SoloPerGM2 (peakcount, autocorr)
     SoloPerGM2 result = f_solo_per_GM2(p_filt_padded, padded_len, fs, timewin, avtime);
 
     features.peakcountLen = result.peakcount_length;
@@ -1087,7 +1079,7 @@ AudioFeatures f_WAV_frankenfunction_reilly(
 tm extractBaseTime(const string& filename) {
     tm baseTime = {}; // Fields initialized to zero
     smatch match;
-    regex pattern(R"((\d{8})_(\d{4}))"); // Matches YYYYMMDD_HHMM
+    regex pattern(R"((\d{8})_(\d{6}))"); // Matches YYYYMMDD_HHMMSS
 
     // Find date / time from file name
     if (regex_search(filename, match, pattern) && match.size() == 3) {
@@ -1099,13 +1091,14 @@ tm extractBaseTime(const string& filename) {
         baseTime.tm_mday = stoi(date.substr(6, 2)); // Day of month
         baseTime.tm_hour = stoi(time.substr(0, 2)) - 1; // Hour
         baseTime.tm_min = stoi(time.substr(2, 2)); // Minute
+        baseTime.tm_sec = stoi(time.substr(4, 2)); // Second
     }
 
     return baseTime;
 }
 
 void extractTimestamp(const string& filename, int& year, int& month, int& day, int& hour, int& minute, int& second) {
-    year = month = day = hour = minute = 0;
+    year = month = day = hour = minute = second = 0;
     smatch match;
     regex pattern(R"((\d{8})_(\d{6}))"); // Extract YYYYMMDD_HHMMSS
 
@@ -1119,6 +1112,7 @@ void extractTimestamp(const string& filename, int& year, int& month, int& day, i
             day = stoi(date.substr(6, 2));
             hour = stoi(time.substr(0, 2));
             minute = stoi(time.substr(2, 2));
+            second = stoi(time.substr(4, 2));
         }
     }
 }
@@ -1131,128 +1125,140 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
         return;
     }
 
-    // CSV Header
-    outputFile << "Filename,Year,Month,Day,Hour,Minute,SegmentDuration,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount,";
-
-    // Maximum autocorrelation matrix size across files
+    // Determine max autocorr matrix size
     int maxAutocorrRows = 0;
     int maxAutocorrCols = 0;
+
     for (int i = 0; i < numFiles; ++i) {
         const AudioFeatures& feature = allFeatures[i];
         if (feature.autocorr != nullptr && feature.autocorrRows > 0 && feature.autocorrCols > 0) {
-            maxAutocorrRows = max(maxAutocorrRows, feature.autocorrRows);
-            maxAutocorrCols = max(maxAutocorrCols, feature.autocorrCols);
+            if (feature.autocorrRows > maxAutocorrRows) {
+                maxAutocorrRows = feature.autocorrRows;
+            }
+            if (feature.autocorrCols > maxAutocorrCols) {
+                maxAutocorrCols = feature.autocorrCols;
+            }
         }
     }
 
-    // Autocorrelation headers
-    for (int i = 0; i < maxAutocorrRows; ++i) {
-        for (int j = 0; j < maxAutocorrCols; ++j) {
-            outputFile << "Autocorr_" << i << "_" << j;
-            if (i < maxAutocorrRows - 1 || j < maxAutocorrCols - 1) {
-                outputFile << ",";
+    // Allocate array for valid autocorr columns
+    bool* validAutocorrCols = new bool[maxAutocorrCols];
+    for (int j = 0; j < maxAutocorrCols; ++j) {
+        validAutocorrCols[j] = false;
+    }
+
+    // Remove extra autocorr columns
+    for (int i = 0; i < numFiles; ++i) {
+        const AudioFeatures& feature = allFeatures[i];
+        if (feature.autocorr != nullptr) {
+            for (int r = 0; r < feature.autocorrRows; ++r) {
+                for (int c = 0; c < feature.autocorrCols; ++c) {
+                    if (!isnan(feature.autocorr[r][c])) {
+                        validAutocorrCols[c] = true;
+                    }
+                }
             }
+        }
+    }
+
+    // CSV Header
+    outputFile << "Filename,Year,Month,Day,Hour,Minute,SegmentDuration,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount";
+    for (int j = 0; j < maxAutocorrCols; ++j) {
+        if (validAutocorrCols[j]) {
+            outputFile << ",Autocorr_" << j;
         }
     }
     outputFile << "\n";
 
-    // Write records for each file
+    // Write data
     for (int fileIdx = 0; fileIdx < numFiles; ++fileIdx) {
         const AudioFeatures& features = allFeatures[fileIdx];
 
-        // Maximum length across each feature
-        int maxLength = 0;
-        maxLength = max(maxLength, features.SPLrmsLen);
-        maxLength = max(maxLength, features.SPLpkLen);
-        maxLength = max(maxLength, features.impulsivityLen);
-        maxLength = max(maxLength, features.dissimLen);
-        maxLength = max(maxLength, features.peakcountLen);
+        int maxLength = max({ features.SPLrmsLen, features.SPLpkLen,
+                              features.impulsivityLen, features.dissimLen,
+                              features.peakcountLen });
 
-        // Find start time from filename
         tm baseTime = extractBaseTime(filenames[fileIdx]);
-        time_t baseEpoch = mktime(&baseTime); // Convert baseTime to time_t
+        time_t baseEpoch = mktime(&baseTime);
+        tm* firstTime = localtime(&baseEpoch);
 
-        // Each time window
+        bool useNanTimestamp = false;
+        if (!firstTime || (firstTime->tm_year + 1900) < 1900) {
+            useNanTimestamp = true;
+        }
+
         for (int i = 0; i < maxLength; ++i) {
-            time_t currentEpoch = baseEpoch + i * 60; // Add i minutes
+            time_t currentEpoch = baseEpoch + i * 60;
             tm* currentTime = localtime(&currentEpoch);
 
-            // Write timestamp / metadata columns
             outputFile << filenames[fileIdx] << ",";
-            outputFile << (currentTime->tm_year + 1900) << ","
-                    << (currentTime->tm_mon + 1) << ","
-                    << currentTime->tm_mday << ","
-                    << currentTime->tm_hour << ","
-                    << currentTime->tm_min << ",";
 
-            if (i < features.segmentDurationLen) { // SegmentDuration
+            if (useNanTimestamp || !currentTime) {
+                outputFile << "nan,nan,nan,nan,nan,";
+            }
+            else {
+                outputFile << (currentTime->tm_year + 1900) << ","
+                           << (currentTime->tm_mon + 1) << ","
+                           << currentTime->tm_mday << ","
+                           << currentTime->tm_hour << ","
+                           << currentTime->tm_min << ",";
+            }
+
+            if (i < features.segmentDurationLen) {
                 outputFile << features.segmentDuration[i];
             }
             else {
-                outputFile << "nan";
+                outputFile << NAN;
             }
             outputFile << ",";
 
-            if (i < features.SPLrmsLen) { // SPLrms
+            if (i < features.SPLrmsLen) {
                 outputFile << features.SPLrms[i];
             }
             else {
-                outputFile << "nan";
+                outputFile << NAN;
             }
             outputFile << ",";
 
-            if (i < features.SPLpkLen) { // SPLpk
+            if (i < features.SPLpkLen) {
                 outputFile << features.SPLpk[i];
             }
             else {
-                outputFile << "nan";
+                outputFile << NAN;
             }
             outputFile << ",";
 
-            if (i < features.impulsivityLen) { // Impulsivity
+            if (i < features.impulsivityLen) {
                 outputFile << features.impulsivity[i];
             }
             else {
-                outputFile << "nan";
+                outputFile << NAN;
             }
             outputFile << ",";
 
-            if (i < features.dissimLen) { // Dissimilarity
+            if (i < features.dissimLen) {
                 outputFile << features.dissim[i];
             }
             else {
-                outputFile << "nan";
+                outputFile << NAN;
             }
             outputFile << ",";
 
-            if (i < features.peakcountLen) { // Peak count
+            if (i < features.peakcountLen) {
                 outputFile << features.peakcount[i];
             }
             else {
-                outputFile << "nan";
+                outputFile << NAN;
             }
-            outputFile << ",";
 
-            // Autocorrelation
-            if (features.autocorr != nullptr && i < features.autocorrRows) { // Row = segment, col = lag
-                // Write autocorrelation records
-                for (int j = 0; j < features.autocorrCols; ++j) {
-                    outputFile << features.autocorr[i][j];
-                    if (j < features.autocorrCols - 1) {
-                        outputFile << ",";
+            for (int j = 0; j < maxAutocorrCols; ++j) {
+                if (validAutocorrCols[j]) {
+                    outputFile << ",";
+                    if (features.autocorr && i < features.autocorrRows && j < features.autocorrCols) {
+                        outputFile << features.autocorr[i][j];
                     }
-                }
-                // Fill extra records with nan
-                for (int j = features.autocorrCols; j < maxAutocorrCols; ++j) {
-                    outputFile << ",nan";
-                }
-            }
-            else {
-                // Fill extra records with nan
-                for (int j = 0; j < maxAutocorrCols; ++j) {
-                    outputFile << "nan";
-                    if (j < maxAutocorrCols - 1) {
-                        outputFile << ",";
+                    else {
+                        outputFile << "nan";
                     }
                 }
             }
@@ -1261,6 +1267,8 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
         }
     }
 
+    // Clean up
+    delete[] validAutocorrCols;
     outputFile.close();
 }
 
@@ -1305,7 +1313,7 @@ int main(int argc, char* argv[]) {
     int flow = 1; // Low frequency cutoff (Hz)
     int fhigh = 192000; // High frequency cutoff (Hz)
     int max_threads = 4; // # of threads for parallel processing
-    int downsample = -1; // Downsampling factor (No downsampling if nefirstFFTMagnitudetive)
+    int downsample = -1; // Downsampling factor (No downsampling if negative)
     bool omit_partial_minute = false; // Ignore incomplete time segments
 
     // Command line argument parsing
