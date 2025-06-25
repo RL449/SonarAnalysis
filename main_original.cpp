@@ -76,7 +76,7 @@ struct AudioFeatures {
     double* dissim = nullptr; // Dissimilarity between segments
     double* peakcount = nullptr; // # of peaks
     double** autocorr = nullptr; // Autocorrelation matrix
-    
+
     // # of segments
     int segmentDurationLen = 0;
     int SPLrmsLen = 0;
@@ -896,7 +896,7 @@ AudioFeatures f_WAV_frankenfunction_reilly(
     double refSens, int timewin, double avtime, int fft_win,
     int calTone, int flow, int fhigh, int downsample_factor, bool omit_partial_minute) {
 
-    AudioFeatures features;
+    AudioFeatures features = {};
 
     string fixed_file_path = fixFilePath(file_path.string()); // Normalize file path
     // Scaling constants
@@ -1097,26 +1097,6 @@ tm extractBaseTime(const string& filename) {
     return baseTime;
 }
 
-void extractTimestamp(const string& filename, int& year, int& month, int& day, int& hour, int& minute, int& second) {
-    year = month = day = hour = minute = second = 0;
-    smatch match;
-    regex pattern(R"((\d{8})_(\d{6}))"); // Extract YYYYMMDD_HHMMSS
-
-    // Check if file name matches pattern
-    if (regex_search(filename, match, pattern)) {
-        if (match.size() == 3) {
-            string date = match[1]; // Date
-            string time = match[2]; // Time
-            year = stoi(date.substr(0, 4));
-            month = stoi(date.substr(4, 2));
-            day = stoi(date.substr(6, 2));
-            hour = stoi(time.substr(0, 2));
-            minute = stoi(time.substr(2, 2));
-            second = stoi(time.substr(4, 2));
-        }
-    }
-}
-
 // Export saved features to CSV file
 void saveFeaturesToCSV(const char* filename, const char** filenames, int numFiles, const AudioFeatures* allFeatures) {
     ofstream outputFile(filename);
@@ -1208,7 +1188,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 outputFile << features.segmentDuration[i];
             }
             else {
-                outputFile << NAN;
+                outputFile << "nan";
             }
             outputFile << ",";
 
@@ -1216,7 +1196,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 outputFile << features.SPLrms[i];
             }
             else {
-                outputFile << NAN;
+                outputFile << "nan";
             }
             outputFile << ",";
 
@@ -1224,7 +1204,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 outputFile << features.SPLpk[i];
             }
             else {
-                outputFile << NAN;
+                outputFile << "nan";
             }
             outputFile << ",";
 
@@ -1232,7 +1212,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 outputFile << features.impulsivity[i];
             }
             else {
-                outputFile << NAN;
+                outputFile << "nan";
             }
             outputFile << ",";
 
@@ -1240,7 +1220,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 outputFile << features.dissim[i];
             }
             else {
-                outputFile << NAN;
+                outputFile << "nan";
             }
             outputFile << ",";
 
@@ -1248,7 +1228,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 outputFile << features.peakcount[i];
             }
             else {
-                outputFile << NAN;
+                outputFile << "nan";
             }
 
             for (int j = 0; j < maxAutocorrCols; ++j) {
@@ -1429,6 +1409,16 @@ int main(int argc, char* argv[]) {
         availableThreads = 1;
     }
     int numThreads = min(max_threads, availableThreads);
+
+    // Adjust thread count based on fhigh
+    if ((fhigh <= 16000) && (numThreads > 2)) {
+        cout << "fhigh = " << fhigh << " Hz is low\nReducing threads to 2 for stability" << endl;
+        numThreads = min(numThreads, 2);
+    }
+    else if ((fhigh <= 48000) && (numThreads > 4)) {
+        cout << "fhigh = " << fhigh << " Hz is low\nReducing threads to 4 for stability" << endl;
+        numThreads = min(numThreads, 4);
+    }
 
     // Create / launch threads using workerFunction
     thread* threads = new thread[numThreads];
