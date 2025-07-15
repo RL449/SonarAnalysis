@@ -14,31 +14,19 @@
 #include <cassert> // Debugging
 #include <regex> // Parse date / time
 #include <ctime> // Output time formatting
-#include <memory>
-#include <unordered_map>
 
 // Limit thread count to # of cores
-#include <queue>
-#include <condition_variable>
-#include <atomic>
+#include <queue> // Sequential reading of files for threads
+#include <condition_variable> // Thread synchronization
+#include <atomic> // Atomic operations for multithreading
 
 // CUDA
-#include <cuda_runtime.h>
-#include <cufft.h>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/transform.h>
-#include <thrust/reduce.h>
-#include <thrust/functional.h>
-#include <thrust/transform_reduce.h>
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/tuple.h>
-#include <cublas_v2.h>
+#include <cufft.h> // CUDA FFT
+#include <thrust/reduce.h> // Reduction operations
+#include <thrust/device_ptr.h> // Smart pointers
 
 using namespace std; // Standard namespace
 namespace fs = filesystem; // Rename filesystem
-
-const int MAX_FILES = 1000;
 
 // Declare structs
 
@@ -59,8 +47,7 @@ struct BandpassFilter {
     int length; // # of samples
 
     // Constructor
-    BandpassFilter(double* ts, double* spec, int len)
-        : filteredTimeSeries(ts), amplitudeSpectrum(spec), length(len) {}
+    BandpassFilter(double* ts, double* spec, int len) : filteredTimeSeries(ts), amplitudeSpectrum(spec), length(len) {}
 
     // Destructor
     ~BandpassFilter() {
@@ -75,8 +62,7 @@ struct Correlation {
     int length; // Length of the arrays
 
     // Constructor
-    Correlation(double* corr, double* lag, int len)
-        : correlationValues(corr), lags(lag), length(len) {}
+    Correlation(double* corr, double* lag, int len) : correlationValues(corr), lags(lag), length(len) {}
 
     // Destructor
     ~Correlation() {
@@ -92,7 +78,7 @@ struct AudioFeatures {
     double* SPLpk = nullptr; // Peak SPL
     double* impulsivity = nullptr; // Kurtosis
     double* dissim = nullptr; // Dissimilarity between segments
-    int* peakcount = nullptr; // # of peaks
+    int* peakCount = nullptr; // # of peaks
     double** autocorr = nullptr; // Autocorrelation matrix
 
     // # of segments
@@ -101,7 +87,7 @@ struct AudioFeatures {
     int SPLpkLen = 0;
     int impulsivityLen = 0;
     int dissimLen = 0;
-    int peakcountLen = 0;
+    int peakCountLen = 0;
     int autocorrRows = 0; // Time segments
     int autocorrCols = 0; // Lags
 };
@@ -120,11 +106,11 @@ struct AudioInfo {
 
 // Periodicity / impulsivity
 struct SoloPerGM2 {
-    int* peakcount; // # of peaks per time window
+    int* peakCount; // # of peaks per time window
     double** autocorr; // Autocorrelation per segment
-    int peakcount_length; // Length of peakcount array
-    int autocorr_rows; // # of time windows - rows
-    int autocorr_cols; // # of lags - columns
+    int peakcountLength; // Length of peakcount array
+    int autocorrRows; // # of time windows - rows
+    int autocorrCols; // # of lags - columns
 };
 
 struct ArrayShiftFFT {
@@ -132,72 +118,55 @@ struct ArrayShiftFFT {
     int length; // Length of array
 
     // Destructor
-    ~ArrayShiftFFT() {
-        delete[] data;
-    }
+    ~ArrayShiftFFT() { delete[] data; }
 };
 
 // RAII wrapper for FFTW complex buffer + plan
 struct FFTWHandler {
-    fftw_complex* buf = nullptr;
-    fftw_plan fwd_plan = nullptr;
-    fftw_plan inv_plan = nullptr;
-    int size = 0;
+    fftw_complex* buf = nullptr; // Buffer for FFT computation
+    fftw_plan forwardPlan = nullptr; // Forward FFT plan
+    fftw_plan inversePlan = nullptr; // Inverse FFT plan
+    int size = 0; // # of points in FFT
 
+    // Constructor
     FFTWHandler(int N) : size(N) {
         buf = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * N);
         if (!buf) { throw bad_alloc(); }
 
-        fwd_plan = fftw_plan_dft_1d(size, buf, buf, FFTW_FORWARD, FFTW_ESTIMATE);
-        if (!fwd_plan) {
+        forwardPlan = fftw_plan_dft_1d(size, buf, buf, FFTW_FORWARD, FFTW_ESTIMATE);
+        if (!forwardPlan) {
             fftw_free(buf);
             throw runtime_error("FFTW forward plan creation failed");
         }
 
-        inv_plan = fftw_plan_dft_1d(size, buf, buf, FFTW_BACKWARD, FFTW_ESTIMATE);
-        if (!inv_plan) {
-            fftw_destroy_plan(fwd_plan);
+        inversePlan = fftw_plan_dft_1d(size, buf, buf, FFTW_BACKWARD, FFTW_ESTIMATE);
+        if (!inversePlan) {
+            fftw_destroy_plan(forwardPlan);
             fftw_free(buf);
             throw runtime_error("FFTW inverse plan creation failed");
         }
     }
 
+    // Destructor
     ~FFTWHandler() {
-        if (fwd_plan) { fftw_destroy_plan(fwd_plan); }
-        if (inv_plan) { fftw_destroy_plan(inv_plan); }
+        if (forwardPlan) { fftw_destroy_plan(forwardPlan); }
+        if (inversePlan) { fftw_destroy_plan(inversePlan); }
         if (buf) { fftw_free(buf); }
     }
 };
 
 struct ThreadArgs {
-    atomic<int>* nextIndex;
-    int totalFiles;
-    char (*filePaths)[512];
-    AudioFeatures* allFeatures;
-    char (*filenames)[512];
-    int num_bits, peak_volts, timewin, fft_win, arti, flow, fhigh, downsample;
-    double RS, avtime;
-    bool omit_partial_minute;
+    atomic<int>* nextIndex; // Counter for thread-safe file indexing
+    int totalFiles; // # of audio files to process
+    char (*filePaths)[512]; // Input file paths
+    AudioFeatures* allFeatures; // Feature extraction results
+    char (*filenames)[512]; // Names of files
+
+    // User-given arguments
+    int numBits, peakVolts, timeWin, fftWin, arti, fLow, fHigh, downSample;
+    double RS, avTime;
+    bool omitPartialMinute;
 };
-
-// CUDA error checking macro
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(error)); \
-            exit(1); \
-        } \
-    } while(0)
-
-#define CUFFT_CHECK(call) \
-    do { \
-        cufftResult error = call; \
-        if (error != CUFFT_SUCCESS) { \
-            fprintf(stderr, "CUFFT error at %s:%d - %d\n", __FILE__, __LINE__, error); \
-            exit(1); \
-        } \
-    } while(0)
 
 // Replaces backslashes with forward slashes to work with Windows file paths
 string fixFilePath(const string& path) {
@@ -207,7 +176,7 @@ string fixFilePath(const string& path) {
 }
 
 // Read audio samples / extract recording metadata
-AudioData audioread(const string& filename, SampleRange range = {1, -1}) {
+AudioData audioRead(const string& filename, SampleRange range = {1, -1}) {
     SNDFILE* file; // Sound file
     SF_INFO sfinfo = {}; // Sound metadata
 
@@ -220,7 +189,7 @@ AudioData audioread(const string& filename, SampleRange range = {1, -1}) {
     if (range.endSample == -1) { endSample = totalFrames; } // No range specified
     else { endSample = min(range.endSample, totalFrames); }
     
-    int startSample = max(0, range.startSample - 1);
+    int startSample = max(0, range.startSample - 1); // Zero based indexing
     int numFramesToRead = endSample - startSample;
 
     if (numFramesToRead <= 0) { // Invalid arguments provided
@@ -237,29 +206,18 @@ AudioData audioread(const string& filename, SampleRange range = {1, -1}) {
 
     switch (format) {
         case SF_FORMAT_PCM_16: { // 16 bit
-            short* temp = new short[numFramesToRead * numChannels];
-            sf_readf_short(file, temp, numFramesToRead);
-            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(temp[i]); }
-            delete[] temp;
+            short* tempBuffer = new short[numFramesToRead * numChannels];
+            sf_readf_short(file, tempBuffer, numFramesToRead); // Read into temporary short buffer
+            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(tempBuffer[i]); }
+            delete[] tempBuffer; // Clean up temp buffer
             break;
         }
         case SF_FORMAT_PCM_24:
         case SF_FORMAT_PCM_32: { // 24 or 32 bit
-            int* temp = new int[numFramesToRead * numChannels];
-            sf_readf_int(file, temp, numFramesToRead);
-            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(temp[i]); }
-            delete[] temp;
-            break;
-        }
-        case SF_FORMAT_FLOAT: { // 32 bit float
-            float* temp = new float[numFramesToRead * numChannels];
-            sf_readf_float(file, temp, numFramesToRead);
-            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(temp[i]); }
-            delete[] temp;
-            break;
-        }
-        case SF_FORMAT_DOUBLE: { // 64 bit double
-            sf_readf_double(file, interleavedSamples, numFramesToRead);
+            int* tempBuffer = new int[numFramesToRead * numChannels];
+            sf_readf_int(file, tempBuffer, numFramesToRead); // Read into temporary int buffer
+            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(tempBuffer[i]); }
+            delete[] tempBuffer; // Clean up temp buffer
             break;
         }
         default:
@@ -269,31 +227,31 @@ AudioData audioread(const string& filename, SampleRange range = {1, -1}) {
             throw runtime_error("Unsupported bit format");
     }
 
-    sf_close(file);
+    sf_close(file); // Reading complete
 
-    // Channel data matrix
+    // Channel data matrix: one array per channel
     double** samples = new double*[numChannels];
     for (int ch = 0; ch < numChannels; ++ch) { samples[ch] = new double[numFramesToRead]; }
 
+    // De-interleave sample buffer into one array per channel
     // Separate indices per channel
     for (int i = 0; i < numFramesToRead; ++i) {
         for (int ch = 0; ch < numChannels; ++ch) { samples[ch][i] = interleavedSamples[i * numChannels + ch]; }
     }
 
-    delete[] interleavedSamples; // Deallocate memory
+    delete[] interleavedSamples; // Deallocate interleaved buffer
 
     return AudioData{samples, numChannels, numFramesToRead, sfinfo.samplerate}; // Metadata
 }
 
-AudioInfo audioread_info(const string& file_path) {
+AudioInfo audioReadInfo(const string& filePath) {
     SF_INFO sfInfo = {0}; // Struct containing sound metadata (frames, samplerate, channels, format)
-    SNDFILE* file = sf_open(file_path.c_str(), SFM_READ, &sfInfo); // Open audio file in read mode
+    SNDFILE* file = sf_open(filePath.c_str(), SFM_READ, &sfInfo); // Open audio file in read mode
 
-    if (!file) { throw runtime_error("Error opening audio file: " + file_path); } // Error opening file
+    if (!file) { throw runtime_error("Error opening audio file: " + filePath); } // Error opening file
 
     int sampleRate = sfInfo.samplerate; // Get sample rate
     int numFrames = sfInfo.frames; // Get # of frames
-
     float duration = static_cast<float>(numFrames) / sampleRate; // Calculate duration (seconds)
 
     sf_close(file); // Close file after reading info
@@ -301,805 +259,755 @@ AudioInfo audioread_info(const string& file_path) {
     return {sampleRate, duration};
 }
 
-__global__ void downsample_kernel(const double* x, double* result, int length, int factor) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx * factor < length) { result[idx] = x[idx * factor]; }
+__global__ void downsampleKernel(const double* x, double* result, int length, int factor) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x; // Compute global index of thread
+    if (index * factor < length) { result[index] = x[index * factor]; } // Determine if downsampled data is in input bounds
 }
 
 // Reduce sampling rate by analyzing (1 / factor) samples
-double* downsample(const double* x, int length, int factor, int& newLength) {
-    if (factor <= 0) { throw invalid_argument("Factor must be positive"); }
+double* downSample(const double* x, int length, int factor, int& newLength) {
+    if (factor <= 0) { throw invalid_argument("Factor must be positive"); } // Validate input
 
-    newLength = (length + factor - 1) / factor;
+    newLength = (length + factor - 1) / factor; // # of samples in downsampled signal
 
     // Allocate GPU memory
-    double* d_input;
-    double* d_output;
-    cudaMalloc(&d_input, sizeof(double) * length);
-    cudaMalloc(&d_output, sizeof(double) * newLength);
+    double* deviceInput;
+    double* deviceOutput;
+    cudaMalloc(&deviceInput, sizeof(double) * length);
+    cudaMalloc(&deviceOutput, sizeof(double) * newLength);
 
-    // Copy input to device
-    cudaMemcpy(d_input, x, sizeof(double) * length, cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceInput, x, sizeof(double) * length, cudaMemcpyHostToDevice); // Copy input signal from host to device
 
     // Launch kernel
-    int threads = 256;
-    int blocks = (newLength + threads - 1) / threads;
-    downsample_kernel << <blocks, threads >> > (d_input, d_output, length, factor);
+    int threads = 256; // # of threads per block
+    int blocks = (newLength + threads - 1) / threads; // # of blocks
+    downsampleKernel <<<blocks, threads >>> (deviceInput, deviceOutput, length, factor);
 
-    // Copy result back to host
-    double* result = new double[newLength];
-    cudaMemcpy(result, d_output, sizeof(double) * newLength, cudaMemcpyDeviceToHost);
+    double* result = new double[newLength]; // Allocate memory on host
+    cudaMemcpy(result, deviceOutput, sizeof(double) * newLength, cudaMemcpyDeviceToHost); // Copy downsampled result to host
 
-    // Cleanup
-    cudaFree(d_input);
-    cudaFree(d_output);
+    // Deallocate GPU memory
+    cudaFree(deviceInput);
+    cudaFree(deviceOutput);
 
-    return result;
+    return result; // Downsampled signal
 }
 
-__global__ void fftshift_kernel(const double* input, double* shifted, int length) {
+__global__ void fftShiftKernel(const double* input, double* shifted, int length) {
+    // Shift array to center around zero index component
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // Global index
+    if (i < length) { shifted[i] = input[(i + (length / 2)) % length]; } // Process valid indices
+}
+
+// CUDA kernel to compute shifted frequency array / apply bandpass filter
+__global__ void applyBandpassFilter(cufftDoubleComplex* freqData, int numPoints, double freqStep, double fLow, double fHigh) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < length) { shifted[i] = input[(i + (length / 2)) % length]; }
-}
+    if (i >= numPoints) { return; }
 
-// Manually shift zero-frequency to center of array
-ArrayShiftFFT fftshift(double* input, int length) {
-    double* d_input;
-    double* d_output;
+    int shiftedIndex = (i + numPoints / 2) % numPoints;
 
-    cudaMalloc(&d_input, sizeof(double) * length);
-    cudaMalloc(&d_output, sizeof(double) * length);
+    // Convert index to frequency (Hz): Accounts for zero index centering
+    double freq = (shiftedIndex - numPoints / 2) * freqStep;
+    double absFreq = fabs(freq);
 
-    cudaMemcpy(d_input, input, sizeof(double) * length, cudaMemcpyHostToDevice);
-
-    int threads = 256;
-    int blocks = (length + threads - 1) / threads;
-    fftshift_kernel << <blocks, threads >> > (d_input, d_output, length);
-
-    double* shifted = new double[length];
-    cudaMemcpy(shifted, d_output, sizeof(double) * length, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_input);
-    cudaFree(d_output);
-
-    return { shifted, length };
-}
-
-// CUDA kernel to compute shifted frequency array and apply bandpass filter
-__global__ void apply_bandpass_filter(cufftDoubleComplex* freq_data, int N, double freq_step, double flow, double fhigh) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) { return; }
-
-    int shifted_index = (i + N / 2) % N;
-    double freq = (shifted_index - N / 2) * freq_step;
-    double abs_freq = fabs(freq);
-
-    if (abs_freq < flow || abs_freq > fhigh) {
-        freq_data[i].x = 0.0;
-        freq_data[i].y = 0.0;
+    // Zero out components outside specified range
+    if (absFreq < fLow || absFreq > fHigh) {
+        freqData[i].x = 0.0;
+        freqData[i].y = 0.0;
     }
 }
 
-// CUDA kernel to normalize inverse FFT and compute amplitude spectrum
-__global__ void normalize_and_compute_amplitude(const cufftDoubleComplex* time_data, double* output_time, double* output_amp, int N) {
+// CUDA kernel to normalize inverse FFT / compute amplitude spectrum
+__global__ void normalizeAndComputeAmplitude(const cufftDoubleComplex* timeData, double* outputTime, double* outputAmp, int numPoints) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) { return; }
+    if (i >= numPoints) { return; }
 
-    double norm = 1.0 / N;
-    output_time[i] = time_data[i].x * norm;
-    output_amp[i] = sqrt(time_data[i].x * time_data[i].x + time_data[i].y * time_data[i].y);
+    double norm = 1.0 / numPoints;
+    outputTime[i] = timeData[i].x * norm; // Normalize inverse FFT real output
+    outputAmp[i] = sqrt(timeData[i].x * timeData[i].x + timeData[i].y * timeData[i].y); // Compute magnitude at each point
 }
 
 // Apply bandpass filter in frequency domain
-BandpassFilter bandpass_filter(const double* time_series, int num_pts, double frequency, double flow, double fhigh) {
+BandpassFilter bandpassFilter(const double* timeSeries, int numPts, double frequency, double flow, double freqHigh) {
     // Allocate memory on device
-    cufftDoubleComplex* d_freq_data;
-    cudaMalloc(&d_freq_data, sizeof(cufftDoubleComplex) * num_pts);
+    cufftDoubleComplex* deviceFreqData;
+    cudaMalloc(&deviceFreqData, sizeof(cufftDoubleComplex) * numPts);
 
-    // Copy time_series to device, real part only
-    cufftDoubleComplex* h_input = new cufftDoubleComplex[num_pts];
-    for (int i = 0; i < num_pts; ++i) {
-        h_input[i].x = time_series[i];
-        h_input[i].y = 0.0;
+    // Copy timeSeries to device, real part only
+    cufftDoubleComplex* hostInput = new cufftDoubleComplex[numPts];
+    for (int i = 0; i < numPts; ++i) {
+        hostInput[i].x = timeSeries[i];
+        hostInput[i].y = 0.0;
     }
-    cudaMemcpy(d_freq_data, h_input, sizeof(cufftDoubleComplex) * num_pts, cudaMemcpyHostToDevice);
-    delete[] h_input;
+    cudaMemcpy(deviceFreqData, hostInput, sizeof(cufftDoubleComplex) * numPts, cudaMemcpyHostToDevice); // Copy frequency data to device
+    delete[] hostInput; // Free host memory
 
     // Execute forward FFT
-    cufftHandle plan_fwd;
-    cufftPlan1d(&plan_fwd, num_pts, CUFFT_Z2Z, 1);
-    cufftExecZ2Z(plan_fwd, d_freq_data, d_freq_data, CUFFT_FORWARD);
+    cufftHandle planForward;
+    cufftPlan1d(&planForward, numPts, CUFFT_Z2Z, 1);
+    cufftExecZ2Z(planForward, deviceFreqData, deviceFreqData, CUFFT_FORWARD);
 
     // Apply bandpass filter
-    double reclen = num_pts * frequency;
-    double freq_step = 1.0 / reclen;
-    if (fhigh == 0.0) { fhigh = 0.5 / frequency; }
+    double recordingLen = numPts * frequency; // Time span (seconds)
+    double freqStep = 1.0 / recordingLen;
+    if (freqHigh == 0.0) { freqHigh = 0.5 / frequency; }
 
+    // Zero out frequencies outside given range
     int threads = 256;
-    int blocks = (num_pts + threads - 1) / threads;
-    apply_bandpass_filter << <blocks, threads >> > (d_freq_data, num_pts, freq_step, flow, fhigh);
-    cudaDeviceSynchronize();
+    int blocks = (numPts + threads - 1) / threads;
+    applyBandpassFilter <<<blocks, threads >>> (deviceFreqData, numPts, freqStep, flow, freqHigh);
+    cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
     // Execute inverse FFT
-    cufftExecZ2Z(plan_fwd, d_freq_data, d_freq_data, CUFFT_INVERSE); // Reuse plan
+    cufftExecZ2Z(planForward, deviceFreqData, deviceFreqData, CUFFT_INVERSE); // Reuse plan
 
     // Allocate output arrays
-    double* d_time_out;
-    double* d_amp_out;
-    cudaMalloc(&d_time_out, sizeof(double) * num_pts);
-    cudaMalloc(&d_amp_out, sizeof(double) * num_pts);
+    double* deviceTimeOut;
+    double* deviceAmplitudeOut;
+    cudaMalloc(&deviceTimeOut, sizeof(double) * numPts);
+    cudaMalloc(&deviceAmplitudeOut, sizeof(double) * numPts);
 
-    normalize_and_compute_amplitude << <blocks, threads >> > (d_freq_data, d_time_out, d_amp_out, num_pts);
-    cudaDeviceSynchronize();
+    normalizeAndComputeAmplitude <<<blocks, threads >>> (deviceFreqData, deviceTimeOut, deviceAmplitudeOut, numPts);
+    cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
     // Copy results to host
-    double* time_series_filt = new double[num_pts];
-    double* amp_spectrum = new double[num_pts];
-    cudaMemcpy(time_series_filt, d_time_out, sizeof(double) * num_pts, cudaMemcpyDeviceToHost);
-    cudaMemcpy(amp_spectrum, d_amp_out, sizeof(double) * num_pts, cudaMemcpyDeviceToHost);
+    double* timeSeriesFilt = new double[numPts];
+    double* amplitudeSpectrum = new double[numPts];
+    cudaMemcpy(timeSeriesFilt, deviceTimeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost); // Copy time series data to host
+    cudaMemcpy(amplitudeSpectrum, deviceAmplitudeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost); // Copy magnitude spectrum to host
 
     // Cleanup
-    cufftDestroy(plan_fwd);
-    cudaFree(d_freq_data);
-    cudaFree(d_time_out);
-    cudaFree(d_amp_out);
+    cufftDestroy(planForward);
+    cudaFree(deviceFreqData);
+    cudaFree(deviceTimeOut);
+    cudaFree(deviceAmplitudeOut);
 
-    return BandpassFilter(time_series_filt, amp_spectrum, num_pts);
+    return BandpassFilter(timeSeriesFilt, amplitudeSpectrum, numPts);
 }
 
-__global__ void partial_sums_kernel(const double* data, double* sum_out, double* sum_sq_out, int N) {
-    __shared__ double local_sum[256];
-    __shared__ double local_sum_sq[256];
+__global__ void partialSumsKernel(const double* data, double* sumOut, double* sumSqOut, int pointsPerTimeWin) {
+    // Shared memory per thread block
+    __shared__ double localSum[256];
+    __shared__ double localSumSq[256];
 
-    int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Thread / global index
+    int threadIndex = threadIdx.x;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    double val = (i < N) ? data[i] : 0.0;
-    local_sum[tid] = val;
-    local_sum_sq[tid] = val * val;
-    __syncthreads();
+    double val; // Load current val
+    if (index < pointsPerTimeWin) { val = data[index]; }
+    else { val = 0.0; }
+    localSum[threadIndex] = val;
+    localSumSq[threadIndex] = val * val;
+    __syncthreads(); // Ensure all threads have written
 
     // Reduce within block
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            local_sum[tid] += local_sum[tid + s];
-            local_sum_sq[tid] += local_sum_sq[tid + s];
+    for (int stepSize = blockDim.x / 2; stepSize > 0; stepSize >>= 1) {
+        if (threadIndex < stepSize) {
+            localSum[threadIndex] += localSum[threadIndex + stepSize];
+            localSumSq[threadIndex] += localSumSq[threadIndex + stepSize];
         }
-        __syncthreads();
+        __syncthreads(); // Ensure all threads have written
     }
 
-    if (tid == 0) {
-        sum_out[blockIdx.x] = local_sum[0];
-        sum_sq_out[blockIdx.x] = local_sum_sq[0];
+    // First thread in each block writes result to global memory
+    if (threadIndex == 0) {
+        sumOut[blockIdx.x] = localSum[0]; // Block sum
+        sumSqOut[blockIdx.x] = localSumSq[0]; // Block sum of squares
     }
 }
 
-__global__ void fourth_moment_kernel(const double* data, double* fourth_out, double mean, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) { return; }
+__global__ void fourthMomentKernel(const double* data, double* fourthOut, double mean, int pointsPerTimeWin) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // Global index
+    if (i >= pointsPerTimeWin) { return; } // Protect against out of bounds threads
 
+    // Fourth central moment
     double centered = data[i] - mean;
-    fourth_out[i] = centered * centered * centered * centered;
+    fourthOut[i] = centered * centered * centered * centered;
 }
 
 // Calculate kurtosis used for impulsivity of a signal
-double calculate_kurtosis(const double* h_data, int N) {
-    if (N <= 0 || h_data == nullptr) { throw invalid_argument("Input array is empty or null"); }
+double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
+    if (pointsPerTimeWin <= 0 || hostData == nullptr) { throw invalid_argument("Input array is empty or null"); }
 
     // Allocate device memory
-    double* d_data, * d_sum_partial, * d_sum_sq_partial, * d_fourth;
-    cudaMalloc(&d_data, N * sizeof(double));
-    cudaMemcpy(d_data, h_data, N * sizeof(double), cudaMemcpyHostToDevice);
+    double* deviceData, * deviceSumPartial, * deviceSumSqPartial, * deviceFourth;
+    cudaMalloc(&deviceData, pointsPerTimeWin * sizeof(double));
+    cudaMemcpy(deviceData, hostData, pointsPerTimeWin * sizeof(double), cudaMemcpyHostToDevice); // Copy data to device
 
+    // Thread / block setup
     int threads = 256;
-    int blocks = (N + threads - 1) / threads;
+    int blocks = (pointsPerTimeWin + threads - 1) / threads;
 
-    cudaMalloc(&d_sum_partial, blocks * sizeof(double));
-    cudaMalloc(&d_sum_sq_partial, blocks * sizeof(double));
+    cudaMalloc(&deviceSumPartial, blocks * sizeof(double));
+    cudaMalloc(&deviceSumSqPartial, blocks * sizeof(double));
 
-    // First pass: Compute mean / variance components
-    partial_sums_kernel << <blocks, threads >> > (d_data, d_sum_partial, d_sum_sq_partial, N);
-    cudaDeviceSynchronize();
+    // Compute mean / variance components
+    partialSumsKernel <<<blocks, threads >>> (deviceData, deviceSumPartial, deviceSumSqPartial, pointsPerTimeWin);
+    cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
-    thrust::device_ptr<double> sum_ptr(d_sum_partial);
-    thrust::device_ptr<double> sum_sq_ptr(d_sum_sq_partial);
+    // Reduce partial results to final results
+    // thrust::device_ptr = Can be used with thrust algorithms
+    thrust::device_ptr<double> sumPtr(deviceSumPartial);
+    thrust::device_ptr<double> sumSqPtr(deviceSumSqPartial);
 
-    double total_sum = thrust::reduce(sum_ptr, sum_ptr + blocks, 0.0, thrust::plus<double>());
-    double total_sum_sq = thrust::reduce(sum_sq_ptr, sum_sq_ptr + blocks, 0.0, thrust::plus<double>());
+    // Sum values in parallel
+    double totalSum = thrust::reduce(sumPtr, sumPtr + blocks, 0.0, thrust::plus<double>());
+    double totalSumSq = thrust::reduce(sumSqPtr, sumSqPtr + blocks, 0.0, thrust::plus<double>());
 
-    double mean = total_sum / N;
-    double mean_sq = mean * mean;
-    double variance = (total_sum_sq / N) - mean_sq;
+    double mean = totalSum / pointsPerTimeWin;
+    double variance = (totalSumSq / pointsPerTimeWin) - (mean * mean);
 
-    if (variance < 1e-12) {
-        cudaFree(d_data); cudaFree(d_sum_partial); cudaFree(d_sum_sq_partial);
+    if (variance < 1e-12) { // Avoid divide by zero
+        cudaFree(deviceData);
+        cudaFree(deviceSumPartial);
+        cudaFree(deviceSumSqPartial);
         return 0.0;
     }
 
-    // Second pass: Compute fourth moment
-    cudaMalloc(&d_fourth, N * sizeof(double));
-    fourth_moment_kernel << <blocks, threads >> > (d_data, d_fourth, mean, N);
-    cudaDeviceSynchronize();
+    // Compute fourth moment
+    cudaMalloc(&deviceFourth, pointsPerTimeWin * sizeof(double));
+    fourthMomentKernel <<<blocks, threads >>> (deviceData, deviceFourth, mean, pointsPerTimeWin);
+    cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
-    thrust::device_ptr<double> fourth_ptr(d_fourth);
-    double fourth_moment = thrust::reduce(fourth_ptr, fourth_ptr + N, 0.0, thrust::plus<double>()) / N;
+    // Reduce fourth moment array to scalar value / sum values in parallel
+    thrust::device_ptr<double> fourthPtr(deviceFourth);
+    double fourthMoment = thrust::reduce(fourthPtr, fourthPtr + pointsPerTimeWin, 0.0, thrust::plus<double>()) / pointsPerTimeWin;
 
     // Cleanup
-    cudaFree(d_data);
-    cudaFree(d_sum_partial);
-    cudaFree(d_sum_sq_partial);
-    cudaFree(d_fourth);
+    cudaFree(deviceData);
+    cudaFree(deviceSumPartial);
+    cudaFree(deviceSumSqPartial);
+    cudaFree(deviceFourth);
 
-    return fourth_moment / (variance * variance);
+    return fourthMoment / (variance * variance); // Kurtosis value
 }
 
 // CUDA kernel for envelope calculation
-__global__ void envelope_kernel(const cufftDoubleComplex* hilbert, double* envelope, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        envelope[idx] = sqrt(hilbert[idx].x * hilbert[idx].x + hilbert[idx].y * hilbert[idx].y);
-    }
+__global__ void envelopeKernel(const cufftDoubleComplex* hilbert, double* envelope, int pointsPerTimeWin) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    // Compute magnitude for idx
+    if (index < pointsPerTimeWin) { envelope[index] = sqrt(hilbert[index].x * hilbert[index].x + hilbert[index].y * hilbert[index].y); }
 }
 
 // CUDA kernel for correlation computation
-__global__ void correlation_kernel(const double* x, const double* y, int series_length, 
-                                 double* corr_vals, int max_lag, int offset) {
+__global__ void correlationKernel(const double* real, const double* imaginary, int seriesLength,
+            double* corrVals, int maxLag, int offset) {
     int lag = blockIdx.x * blockDim.x + threadIdx.x;
-    if (lag > max_lag) { return; }
+    if (lag > maxLag) { return; } // Skip out of range lags
     
-    double sumX = 0.0, sumY = 0.0, sumXSquare = 0.0, sumYSquare = 0.0, sumXYProd = 0.0;
+    // Accumulators for statistical calculations
+    double sumReal = 0.0, sumImagninary = 0.0, sumRealSquare = 0.0, sumImaginarySquare = 0.0, sumRealImaginaryProd = 0.0;
     int sampleCount = 0;
     
-    for (int k = 0; k < series_length - (lag + offset); k++) {
-        double x_val = x[k];
-        double y_val = y[k + lag + offset];
+    // Loop through overlaping samples of current lag
+    for (int i = 0; i < seriesLength - (lag + offset); i++) {
+        double realVal = real[i];
+        double imaginaryVal = imaginary[i + lag + offset];
         
-        if (!isnan(x_val) && !isnan(y_val)) {
-            sumX += x_val;
-            sumY += y_val;
-            sumXSquare += x_val * x_val;
-            sumYSquare += y_val * y_val;
-            sumXYProd += x_val * y_val;
+        if (!isnan(realVal) && !isnan(imaginaryVal)) { // Skip NaNs
+            sumReal += realVal;
+            sumImagninary += imaginaryVal;
+            sumRealSquare += realVal * realVal;
+            sumImaginarySquare += imaginaryVal * imaginaryVal;
+            sumRealImaginaryProd += realVal * imaginaryVal;
             sampleCount++;
         }
     }
     
-    if (sampleCount == 0) {
-        corr_vals[lag] = NAN;
+    if (sampleCount == 0) { // No valid samples
+        corrVals[lag] = NAN;
         return;
     }
     
-    double meanX = sumX / sampleCount;
-    double meanY = sumY / sampleCount;
-    double meanXSquare = sumXSquare / sampleCount;
-    double meanYSquare = sumYSquare / sampleCount;
+    // Means / variances
+    double meanReal = sumReal / sampleCount;
+    double meanImaginary = sumImagninary / sampleCount;
+    double meanXSquare = sumRealSquare / sampleCount;
+    double meanYSquare = sumImaginarySquare / sampleCount;
     
-    double covar = (sumXYProd / sampleCount) - (meanX * meanY);
-    double denomX = sqrt(meanXSquare - (meanX * meanX));
-    double denomY = sqrt(meanYSquare - (meanY * meanY));
+    double covar = (sumRealImaginaryProd / sampleCount) - (meanReal * meanImaginary);
+    double denomReal = sqrt(meanXSquare - (meanReal * meanReal));
+    double denomImaginary = sqrt(meanYSquare - (meanImaginary * meanImaginary));
     
-    if (denomX == 0.0 || denomY == 0.0) { corr_vals[lag] = NAN; }
-    else { corr_vals[lag] = covar / (denomX * denomY); }
+    // Normalize correlation
+    if (denomReal == 0.0 || denomImaginary == 0.0) { corrVals[lag] = NAN; }
+    else { corrVals[lag] = covar / (denomReal * denomImaginary); }
 }
 
 // CUDA kernel for FFT magnitude calculation
-__global__ void fft_magnitude_kernel(const cufftDoubleComplex* fft_data, double* magnitude, int n) {
+__global__ void fftMagnitudeKernel(const cufftDoubleComplex* fftData, double* magnitude, int pointsPerFFT) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {  magnitude[idx] = sqrt(fft_data[idx].x * fft_data[idx].x + fft_data[idx].y * fft_data[idx].y); }
+    if (idx < pointsPerFFT) { magnitude[idx] = sqrt(fftData[idx].x * fftData[idx].x + fftData[idx].y * fftData[idx].y); } // Calculate magnitude
 }
 
 // GPU-accelerated correlation function
-Correlation correl_5_gpu(const double* time_series1, const double* time_series2, 
-            int series_length, int lags, int offset) {
+Correlation correl5GPU(const double* timeSeries1, const double* timeSeries2, 
+            int seriesLength, int lags, int offset) {
     int len = lags + 1;
     
     // Allocate GPU memory
-    double *d_x, *d_y, *d_corr_vals;
-    CUDA_CHECK(cudaMalloc(&d_x, sizeof(double) * series_length));
-    CUDA_CHECK(cudaMalloc(&d_y, sizeof(double) * series_length));
-    CUDA_CHECK(cudaMalloc(&d_corr_vals, sizeof(double) * len));
+    double * deviceReal, * deviceImaginary, * deviceCorrVals;
+    cudaMalloc(&deviceReal, sizeof(double) * seriesLength);
+    cudaMalloc(&deviceImaginary, sizeof(double) * seriesLength);
+    cudaMalloc(&deviceCorrVals, sizeof(double) * len);
     
-    // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(d_x, time_series1, sizeof(double) * series_length, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_y, time_series2, sizeof(double) * series_length, cudaMemcpyHostToDevice));
+    // Copy deviceReal / deviceImaginary to device
+    cudaMemcpy(deviceReal, timeSeries1, sizeof(double) * seriesLength, cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceImaginary, timeSeries2, sizeof(double) * seriesLength, cudaMemcpyHostToDevice);
     
     // Launch correlation kernel
+    // Specify dimensions
     dim3 block(256);
     dim3 grid((len + block.x - 1) / block.x);
-    correlation_kernel<<<grid, block>>>(d_x, d_y, series_length, d_corr_vals, lags, offset);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    correlationKernel<<<grid, block>>>(deviceReal, deviceImaginary, seriesLength, deviceCorrVals, lags, offset);
+    cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
     
-    // Allocate host memory / copy results back
-    double* corr_vals = new double[len];
-    double* lag_vals = new double[len];
+    // Allocate host memory
+    double* corrVals = new double[len];
+    double* lagVals = new double[len];
     
-    CUDA_CHECK(cudaMemcpy(corr_vals, d_corr_vals, sizeof(double) * len, cudaMemcpyDeviceToHost));
+    cudaMemcpy(corrVals, deviceCorrVals, sizeof(double) * len, cudaMemcpyDeviceToHost); // Copy corrVals to host
     
     // Fill lag values
-    for (int i = 0; i < len; ++i) { lag_vals[i] = static_cast<double>(i); }
+    for (int i = 0; i < len; ++i) { lagVals[i] = static_cast<double>(i); }
     
     // Cleanup GPU memory
-    CUDA_CHECK(cudaFree(d_x));
-    CUDA_CHECK(cudaFree(d_y));
-    CUDA_CHECK(cudaFree(d_corr_vals));
+    cudaFree(deviceReal);
+    cudaFree(deviceImaginary);
+    cudaFree(deviceCorrVals);
     
-    return Correlation(corr_vals, lag_vals, len);
+    return Correlation(corrVals, lagVals, len);
 }
 
 // Kernel to square / segment the input
-__global__ void square_and_segment(const double* input, double* output, int samp_window_size, int num_time_wins) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = samp_window_size * num_time_wins;
+__global__ void squareAndSegment(const double* input, double* output, int sampWindowSize, int numTimeWins) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x; // Global thread index
+    int total = sampWindowSize * numTimeWins; // # of samples
 
-    if (idx < total) {
-        double val = input[idx];
-        output[idx] = val * val;
+    if (index < total) {
+        double val = input[index];
+        output[index] = val * val; // Signal energy
     }
 }
 
 // Kernel to average squared values
-__global__ void compute_averages(const double* squared, double* output_avg, int samp_window_size, int avg_win_size, int numavwin, int num_time_wins) {
-    int seg = blockIdx.x;   // segment index
-    int win = threadIdx.x;  // averaging window index
+__global__ void computeAverages(const double* squared, double* outputAvg, int sampWindowSize, int avgWinSize, int numavwin, int numTimeWins) {
+    int segIndex = blockIdx.x; // Segment index
+    int win = threadIdx.x; // Averaging window index
 
-    if (seg < num_time_wins && win < numavwin) {
-        int base_idx = seg * samp_window_size + win * avg_win_size;
+    if (segIndex < numTimeWins && win < numavwin) { // Check bounds
+        int baseIndex = segIndex * sampWindowSize + win * avgWinSize;
         double sum = 0.0;
-        for (int i = 0; i < avg_win_size; i++) { sum += squared[base_idx + i]; }
-        output_avg[seg * numavwin + win] = sum / avg_win_size;
+        for (int i = 0; i < avgWinSize; i++) { sum += squared[baseIndex + i]; } // Sum of samples in window
+        outputAvg[segIndex * numavwin + win] = sum / avgWinSize; // Mean in window
     }
 }
 
 // Calculate autocorrelation / peak counts
-SoloPerGM2 f_solo_per_GM2(const double* p_filt_input, int input_length, double fs, double timewin, double avtime) {
-    int samp_window_size = static_cast<int>(fs * timewin);
-    int num_time_wins = input_length / samp_window_size;
-    if (num_time_wins == 0) { throw runtime_error("Empty time window"); }
+SoloPerGM2 fSoloPerGM2(const double* pFiltInput, int inputLength, double fs, double timewin, double avtime) {
+    // Calculate window sizes
+    int sampWindowSize = static_cast<int>(fs * timewin); // # of samples in time window
+    int numTimeWins = inputLength / sampWindowSize; // # of time windows
+    if (numTimeWins == 0) { throw runtime_error("Empty time window"); }
 
-    int total_samples = samp_window_size * num_time_wins;
-    int avg_win_size = static_cast<int>(fs * avtime);
-    int numavwin = samp_window_size / avg_win_size;
+    int totalSamples = sampWindowSize * numTimeWins;
+    int avgWinSize = static_cast<int>(fs * avtime); // Samples in averaging window
+    int numAvWin = sampWindowSize / avgWinSize; // Averaging windows per time window
 
     // GPU memory allocations
-    double* d_input, * d_squared, * d_avg;
-    cudaMalloc(&d_input, total_samples * sizeof(double));
-    cudaMalloc(&d_squared, total_samples * sizeof(double));
-    cudaMalloc(&d_avg, num_time_wins * numavwin * sizeof(double));
+    double* deviceInput, * deviceSquared, * deviceAvg;
+    cudaMalloc(&deviceInput, totalSamples * sizeof(double));
+    cudaMalloc(&deviceSquared, totalSamples * sizeof(double));
+    cudaMalloc(&deviceAvg, numTimeWins * numAvWin * sizeof(double));
 
-    cudaMemcpy(d_input, p_filt_input, total_samples * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceInput, pFiltInput, totalSamples * sizeof(double), cudaMemcpyHostToDevice); // Copy input to device
 
-    // Launch square + segment kernel
+    // Launch square / segment kernel
     int threads = 256;
-    int blocks = (total_samples + threads - 1) / threads;
-    square_and_segment << <blocks, threads >> > (d_input, d_squared, samp_window_size, num_time_wins);
+    int blocks = (totalSamples + threads - 1) / threads;
+    squareAndSegment <<<blocks, threads >>> (deviceInput, deviceSquared, sampWindowSize, numTimeWins);
 
-    // Launch average kernel
-    compute_averages << <num_time_wins, numavwin >> > (d_squared, d_avg, samp_window_size, avg_win_size, numavwin, num_time_wins);
+    // Calculate average of squared values
+    computeAverages <<<numTimeWins, numAvWin >>> (deviceSquared, deviceAvg, sampWindowSize, avgWinSize, numAvWin, numTimeWins);
 
     // Copy averages back to host
-    double* h_avg = new double[num_time_wins * numavwin];
-    cudaMemcpy(h_avg, d_avg, num_time_wins * numavwin * sizeof(double), cudaMemcpyDeviceToHost);
+    double* hostAvg = new double[numTimeWins * numAvWin];
+    cudaMemcpy(hostAvg, deviceAvg, numTimeWins * numAvWin * sizeof(double), cudaMemcpyDeviceToHost); // Copy averages to host
 
-    // Correlation + peak count (CPU, per segment)
-    int p_avtot_rows = numavwin;
-    int lag_limit = static_cast<int>(p_avtot_rows * 0.7);
-    int p_avtot_cols = num_time_wins;
+    // Outputs for correlation / peak count
+    int pAvTotRows = numAvWin;
+    int lagLimit = static_cast<int>(pAvTotRows * 0.7); // 70% of lags
+    int pAvTotCols = numTimeWins;
 
-    double** acorr = new double* [p_avtot_cols];
-    int* pkcount = new int[p_avtot_cols];
+    double** acorr = new double* [pAvTotCols]; // Autocorrelation per window
+    int* pkcount = new int[pAvTotCols]; // Peak count per window
 
-    for (int zz = 0; zz < p_avtot_cols; zz++) {
-        Correlation corr_result = correl_5_gpu(&h_avg[zz * numavwin], &h_avg[zz * numavwin], p_avtot_rows, lag_limit, 0);
-        acorr[zz] = new double[lag_limit + 1];
-        copy(corr_result.correlationValues, corr_result.correlationValues + lag_limit + 1, acorr[zz]);
+    // Iterate through time windows - Calculate autocorr / peak count
+    for (int i = 0; i < pAvTotCols; i++) {
+        // Calculate correlation
+        Correlation corrResult = correl5GPU(&hostAvg[i * numAvWin], &hostAvg[i * numAvWin], pAvTotRows, lagLimit, 0);
+        acorr[i] = new double[lagLimit + 1];
+        for (int j = 0; j <= lagLimit; ++j) { acorr[i][j] = corrResult.correlationValues[j]; }
 
-        // Peak counting
-        int peak_count = 0;
-        for (int i = 1; i < lag_limit; i++) {
-            if (acorr[zz][i] > acorr[zz][i - 1] && acorr[zz][i] > acorr[zz][i + 1]) {
-                double left_min = acorr[zz][i];
-                for (int j = i - 1; j >= 0 && acorr[zz][j] < acorr[zz][i]; j--) { left_min = min(left_min, acorr[zz][j]); }
-                double right_min = acorr[zz][i];
-                for (int j = i + 1; j <= lag_limit && acorr[zz][j] < acorr[zz][i]; j++) { right_min = min(right_min, acorr[zz][j]); }
-                double prominence = acorr[zz][i] - max(left_min, right_min);
-                if (prominence > 0.5) { peak_count++; }
+        // Calculate peak count
+        int peakCount = 0;
+        for (int j = 1; j < lagLimit; j++) {
+            if (acorr[i][j] > acorr[i][j - 1] && acorr[i][j] > acorr[i][j + 1]) {
+                // Find min to left / right to find prominence
+                double leftMin = acorr[i][j];
+                for (int k = j - 1; k >= 0 && acorr[i][k] < acorr[i][j]; k--) { leftMin = min(leftMin, acorr[i][k]); }
+                double rightMin = acorr[i][j];
+                for (int k = j + 1; k <= lagLimit && acorr[i][k] < acorr[i][j]; k++) { rightMin = min(rightMin, acorr[i][k]); }
+                double prominence = acorr[i][j] - max(leftMin, rightMin);
+                if (prominence > 0.5) { peakCount++; } // Threshold reached
             }
         }
-        pkcount[zz] = peak_count;
+        pkcount[i] = peakCount;
     }
 
     // Free GPU memory
-    cudaFree(d_input);
-    cudaFree(d_squared);
-    cudaFree(d_avg);
-    delete[] h_avg;
+    cudaFree(deviceInput);
+    cudaFree(deviceSquared);
+    cudaFree(deviceAvg);
+    delete[] hostAvg;
 
     // Return result
     SoloPerGM2 result;
-    result.peakcount = pkcount;
+    result.peakCount = pkcount;
     result.autocorr = acorr;
-    result.peakcount_length = p_avtot_cols;
-    result.autocorr_rows = p_avtot_cols;
-    result.autocorr_cols = lag_limit + 1;
+    result.peakcountLength = pAvTotCols;
+    result.autocorrRows = pAvTotCols;
+    result.autocorrCols = lagLimit + 1;
 
     return result;
 }
 
 // CUDA kernel for Hilbert transform filter application
-__global__ void hilbert_filter_kernel(cufftDoubleComplex* data, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) { return; }
+__global__ void hilbertFilterKernel(cufftDoubleComplex* data, int len) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= len) { return; }
     
-    int half = n / 2;
-    int upper = (n % 2 == 0) ? half - 1 : half;
+    int half = len / 2; // Half way point of FFT
+    int upper;
+    if (len % 2 == 0) { upper = half - 1; }
+    else { upper = half; }
     
-    if (idx >= 1 && idx <= upper) {
+    if (index >= 1 && index <= upper) {
         // Multiply positive frequencies by 2
-        data[idx].x *= 2.0;
-        data[idx].y *= 2.0;
-    } else if (idx > half) {
+        data[index].x *= 2.0;
+        data[index].y *= 2.0;
+    } else if (index > half) {
         // Zero out negative frequencies
-        data[idx].x = 0.0;
-        data[idx].y = 0.0;
+        data[index].x = 0.0;
+        data[index].y = 0.0;
     }
 }
 
-// GPU-accelerated Hilbert transform
-#define CUDA_CHECK(call)                                                      \
-    {                                                                         \
-        cudaError_t err = call;                                               \
-        if (err != cudaSuccess) {                                             \
-            cerr << "CUDA error at " << __FILE__ << ":" << __LINE__      \
-                      << " code=" << err << " \"" << cudaGetErrorString(err)  \
-                      << "\"" << endl;                                   \
-            exit(EXIT_FAILURE);                                               \
-        }                                                                     \
-    }
-
-#define CUFFT_CHECK(call)                                                     \
-    {                                                                         \
-        cufftResult err = call;                                               \
-        if (err != CUFFT_SUCCESS) {                                           \
-            cerr << "CUFFT error at " << __FILE__ << ":" << __LINE__    \
-                      << " code=" << err << endl;                        \
-            exit(EXIT_FAILURE);                                               \
-        }                                                                     \
-    }
-
-// CUDA kernel to normalize FFT result in-place
-__global__ void normalize_kernel(cufftDoubleComplex* data, int length) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < length) {
-        data[idx].x /= length;
-        data[idx].y /= length;
+// Convert real input to complex
+__global__ void initializeComplex(double* input, cufftDoubleComplex* output, int len) {
+    int threadIndex = blockIdx.x * blockDim.x + threadIdx.x; // Global thread index
+    if (threadIndex < len) {
+        output[threadIndex].x = input[threadIndex]; // Real
+        output[threadIndex].y = 0.0; // Imaginary
     }
 }
 
-__global__ void initialize_complex(double* input, cufftDoubleComplex* output, int len) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < len) {
-        output[i].x = input[i];
-        output[i].y = 0.0;
+// Normalize inverse FFT result
+__global__ void normalizeResult(cufftDoubleComplex* data, int len) {
+    int threadIndex = blockIdx.x * blockDim.x + threadIdx.x; // Global thread index
+    if (threadIndex < len) {
+        data[threadIndex].x /= len; // Normalize real part
+        data[threadIndex].y /= len; // Normalize imaginary part
     }
 }
 
-__global__ void normalize_result(cufftDoubleComplex* data, int len) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < len) {
-        data[i].x /= len;
-        data[i].y /= len;
-    }
-}
-
-fftw_complex* hilbert_raw_gpu(const double* input, int input_len) {
-    if (!input || input_len <= 0) {
+// Calculate analytic signal using hilbert transform with FFT
+fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
+    if (!input || inputLen <= 0) { // Validate input
         cerr << "Invalid input\n";
         return nullptr;
     }
 
-    cufftDoubleComplex* d_data = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_data, sizeof(cufftDoubleComplex) * input_len));
+    cufftDoubleComplex* deviceData = nullptr; // Final complex array
+    cudaMalloc(&deviceData, sizeof(cufftDoubleComplex) * inputLen);
 
-    double* d_input = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, sizeof(double) * input_len));
-    CUDA_CHECK(cudaMemcpy(d_input, input, sizeof(double) * input_len, cudaMemcpyHostToDevice));
+    double* deviceIinput = nullptr; // Device buffer for input
+    cudaMalloc(&deviceIinput, sizeof(double) * inputLen);
+    cudaMemcpy(deviceIinput, input, sizeof(double) * inputLen, cudaMemcpyHostToDevice); // Copy input to device
 
-    // Initialize d_data = input + 0j
+    // Convert to complex
+    // Specify dimensions
     dim3 block(256);
-    dim3 grid((input_len + block.x - 1) / block.x);
-    initialize_complex << <grid, block >> > (d_input, d_data, input_len);
-    CUDA_CHECK(cudaFree(d_input)); // Free d_input early
+    dim3 grid((inputLen + block.x - 1) / block.x);
+    initializeComplex <<<grid, block >>> (deviceIinput, deviceData, inputLen);
+    cudaFree(deviceIinput); // Free deviceIinput early
 
-    cufftHandle plan;
-    CUFFT_CHECK(cufftPlan1d(&plan, input_len, CUFFT_Z2Z, 1));
-    CUFFT_CHECK(cufftExecZ2Z(plan, d_data, d_data, CUFFT_FORWARD));
+    cufftHandle plan; // FFT plan
+    cufftPlan1d(&plan, inputLen, CUFFT_Z2Z, 1);
+    cufftExecZ2Z(plan, deviceData, deviceData, CUFFT_FORWARD); // Apply FFT: Time to frequency
 
-    hilbert_filter_kernel << <grid, block >> > (d_data, input_len);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    hilbertFilterKernel <<<grid, block >>> (deviceData, inputLen); // Apply filter
+    cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
-    CUFFT_CHECK(cufftExecZ2Z(plan, d_data, d_data, CUFFT_INVERSE));
+    cufftExecZ2Z(plan, deviceData, deviceData, CUFFT_INVERSE); // Apply inverse FFT: Frequency to time
 
-    // Normalize in-place
-    normalize_result << <grid, block >> > (d_data, input_len);
+    // Normalize to preserve amplitude
+    normalizeResult <<<grid, block >>> (deviceData, inputLen);
 
     // Copy result to host
-    fftw_complex* result = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * input_len);
+    fftw_complex* result = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * inputLen);
     if (!result) {
         cerr << "Host allocation failed\n";
-        cudaFree(d_data);
+        cudaFree(deviceData);
         cufftDestroy(plan);
         return nullptr;
     }
 
-    CUDA_CHECK(cudaMemcpy(result, d_data, sizeof(cufftDoubleComplex) * input_len, cudaMemcpyDeviceToHost));
+    cudaMemcpy(result, deviceData, sizeof(cufftDoubleComplex) * inputLen, cudaMemcpyDeviceToHost); // Copy results to host
 
     // Cleanup
-    cudaFree(d_data);
+    cudaFree(deviceData);
     cufftDestroy(plan);
 
     return result;
 }
 
-// GPU-accelerated dissimilarity function
-double* f_solo_dissim_GM1_gpu(double** timechunk_matrix, int pts_per_timewin, int num_timewin,
-    double fft_win, double fs, int& out_len) {
-    
-    int pts_per_fft = static_cast<int>(fft_win * fs);
-    if (pts_per_fft <= 0 || pts_per_timewin <= 0 || num_timewin <= 1) {
-        out_len = 0;
+// Calculate dissimilarity with GPU
+double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTimeWin,
+            double fftWin, double fs, int& outLen) {
+
+    // # of FFT points
+    int ptsPerFFT = static_cast<int>(fftWin * fs);
+    if (ptsPerFFT <= 0 || ptsPerTimewin <= 0 || numTimeWin <= 1) {
+        outLen = 0;
         return nullptr;
     }
 
-    int numfftwin = (pts_per_timewin - pts_per_fft) / pts_per_fft + 1;
+    // # of overlapping FFT windows per time window
+    int numfftwin = (ptsPerTimewin - ptsPerFFT) / ptsPerFFT + 1;
     if (numfftwin <= 0) {
-        out_len = 0;
+        outLen = 0;
         return nullptr;
     }
 
-    out_len = num_timewin - 1;
+    outLen = numTimeWin - 1; // # of outputs
 
-    // Create CUFFT plan
-    cufftHandle fft_plan;
-    if (cufftPlan1d(&fft_plan, pts_per_fft, CUFFT_Z2Z, 1) != CUFFT_SUCCESS) {
-        out_len = 0;
+    // CUFFT plan
+    cufftHandle fftPlan;
+    if (cufftPlan1d(&fftPlan, ptsPerFFT, CUFFT_Z2Z, 1) != CUFFT_SUCCESS) {
+        outLen = 0;
         return nullptr;
     }
 
     // Allocate GPU buffers
-    cufftDoubleComplex* d_fft_input = nullptr;
-    cufftDoubleComplex* d_fft_output = nullptr;
-    double* d_magnitude = nullptr;
-    double* d_envelope1 = nullptr;
-    double* d_envelope2 = nullptr;
-    double* diss = nullptr;
+    cufftDoubleComplex* deviceFFTInput = nullptr;
+    cufftDoubleComplex* deviceFFTOutput = nullptr;
+    double* deviceMagnitude = nullptr;
+    double* deviceEnvelope1 = nullptr;
+    double* deviceEnvelope2 = nullptr;
 
-    // Allocate GPU memory with error checking
-    if (cudaMalloc(&d_fft_input, sizeof(cufftDoubleComplex) * pts_per_fft) != cudaSuccess ||
-        cudaMalloc(&d_fft_output, sizeof(cufftDoubleComplex) * pts_per_fft) != cudaSuccess ||
-        cudaMalloc(&d_magnitude, sizeof(double) * pts_per_fft) != cudaSuccess ||
-        cudaMalloc(&d_envelope1, sizeof(double) * pts_per_timewin) != cudaSuccess ||
-        cudaMalloc(&d_envelope2, sizeof(double) * pts_per_timewin) != cudaSuccess) {
+    // Free partial allocations on failure
+    if (cudaMalloc(&deviceFFTInput, sizeof(cufftDoubleComplex) * ptsPerFFT) != cudaSuccess ||
+        cudaMalloc(&deviceFFTOutput, sizeof(cufftDoubleComplex) * ptsPerFFT) != cudaSuccess ||
+        cudaMalloc(&deviceMagnitude, sizeof(double) * ptsPerFFT) != cudaSuccess ||
+        cudaMalloc(&deviceEnvelope1, sizeof(double) * ptsPerTimewin) != cudaSuccess ||
+        cudaMalloc(&deviceEnvelope2, sizeof(double) * ptsPerTimewin) != cudaSuccess) {
 
-        // Clean up allocated memory
-        if (d_fft_input) { cudaFree(d_fft_input); }
-        if (d_fft_output) { cudaFree(d_fft_output); }
-        if (d_magnitude) { cudaFree(d_magnitude); }
-        if (d_envelope1) { cudaFree(d_envelope1); }
-        if (d_envelope2) { cudaFree(d_envelope2); }
-        cufftDestroy(fft_plan);
-        out_len = 0;
+        cudaFree(deviceFFTInput);
+        cudaFree(deviceFFTOutput);
+        cudaFree(deviceMagnitude);
+        cudaFree(deviceEnvelope1);
+        cudaFree(deviceEnvelope2);
+        cufftDestroy(fftPlan);
+        outLen = 0;
         return nullptr;
     }
 
     // Allocate host result array
-    diss = new(nothrow) double[out_len];
-    if (!diss) {
-        cudaFree(d_fft_input);
-        cudaFree(d_fft_output);
-        cudaFree(d_magnitude);
-        cudaFree(d_envelope1);
-        cudaFree(d_envelope2);
-        cufftDestroy(fft_plan);
-        out_len = 0;
-        return nullptr;
-    }
+    double* diss = new double[outLen];
 
-    // Pre-allocate host vectors to avoid repeated allocation/deallocation
-    vector<cufftDoubleComplex> hil1_host(pts_per_timewin);
-    vector<cufftDoubleComplex> hil2_host(pts_per_timewin);
-    vector<cufftDoubleComplex> fft_input_host(pts_per_fft);
+    // Temporary buffers for hilbert / fft inputs
+    cufftDoubleComplex* hil1Host = new cufftDoubleComplex[ptsPerTimewin];
+    cufftDoubleComplex* hil2Host = new cufftDoubleComplex[ptsPerTimewin];
+    cufftDoubleComplex* fftInputHost = new cufftDoubleComplex[ptsPerFFT];
+    double* envelope1Host = new double[ptsPerTimewin];
+    double* envelope2Host = new double[ptsPerTimewin];
+    double* magnitudeHost = new double[ptsPerFFT];
+    double* fftAHost = new double[ptsPerFFT];
+    double* fftBHost = new double[ptsPerFFT];
 
+    // Specify dimensions
     dim3 block(256);
-    dim3 grid_fft((pts_per_fft + block.x - 1) / block.x);
-    dim3 grid_env((pts_per_timewin + block.x - 1) / block.x);
+    dim3 gridFFT((ptsPerFFT + block.x - 1) / block.x);
+    dim3 gridEnv((ptsPerTimewin + block.x - 1) / block.x);
 
-    for (int i = 0; i < out_len; ++i) {
-        fftw_complex* hil1 = hilbert_raw_gpu(timechunk_matrix[i], pts_per_timewin);
-        fftw_complex* hil2 = hilbert_raw_gpu(timechunk_matrix[i + 1], pts_per_timewin);
+    // Iterate over adjacent pairs of time chunks
+    for (int i = 0; i < outLen; ++i) {
+        // Calculate analytic signals
+        fftw_complex* hil1 = hilbertRawGPU(timechunkMatrix[i], ptsPerTimewin);
+        fftw_complex* hil2 = hilbertRawGPU(timechunkMatrix[i + 1], ptsPerTimewin);
 
-        if (!hil1 || !hil2) {
+        if (!hil1 || !hil2) { // Failed hilbert computations
             diss[i] = NAN;
-            if (hil1) { fftw_free(hil1); }
-            if (hil2) { fftw_free(hil2); }
+            if (hil1) fftw_free(hil1);
+            if (hil2) fftw_free(hil2);
             continue;
         }
 
-        // Create device vectors for hilbert transforms
-        thrust::device_vector<cufftDoubleComplex> gpu_hil1(pts_per_timewin);
-        thrust::device_vector<cufftDoubleComplex> gpu_hil2(pts_per_timewin);
-
-        // Convert / copy hilbert data to device
-        for (int k = 0; k < pts_per_timewin; ++k) {
-            hil1_host[k].x = hil1[k][0];
-            hil1_host[k].y = hil1[k][1];
-            hil2_host[k].x = hil2[k][0];
-            hil2_host[k].y = hil2[k][1];
+        // Copy hilbert result to host cufftDoubleComplex arrays
+        for (int k = 0; k < ptsPerTimewin; ++k) {
+            hil1Host[k].x = hil1[k][0];
+            hil1Host[k].y = hil1[k][1];
+            hil2Host[k].x = hil2[k][0];
+            hil2Host[k].y = hil2[k][1];
         }
 
-        gpu_hil1 = hil1_host;
-        gpu_hil2 = hil2_host;
-
-        // Free hilbert transforms
         fftw_free(hil1);
         fftw_free(hil2);
 
-        // Calculate envelopes
-        envelope_kernel << <grid_env, block >> > (thrust::raw_pointer_cast(gpu_hil1.data()), d_envelope1, pts_per_timewin);
-        envelope_kernel << <grid_env, block >> > (thrust::raw_pointer_cast(gpu_hil2.data()), d_envelope2, pts_per_timewin);
+        // Copy hilbert data to device
+        cufftDoubleComplex* deviceHil1 = nullptr;
+        cufftDoubleComplex* deviceHil2 = nullptr;
+        cudaMalloc(&deviceHil1, sizeof(cufftDoubleComplex) * ptsPerTimewin);
+        cudaMalloc(&deviceHil2, sizeof(cufftDoubleComplex) * ptsPerTimewin);
+        cudaMemcpy(deviceHil1, hil1Host, sizeof(cufftDoubleComplex) * ptsPerTimewin, cudaMemcpyHostToDevice);
+        cudaMemcpy(deviceHil2, hil2Host, sizeof(cufftDoubleComplex) * ptsPerTimewin, cudaMemcpyHostToDevice);
 
-        if (cudaDeviceSynchronize() != cudaSuccess) {
-            diss[i] = NAN;
-            continue;
-        }
+        // Compute amplitude envelopes on device
+        envelopeKernel <<<gridEnv, block >>> (deviceHil1, deviceEnvelope1, ptsPerTimewin);
+        envelopeKernel <<<gridEnv, block >>> (deviceHil2, deviceEnvelope2, ptsPerTimewin);
+        cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
-        // Create device vectors for envelopes
-        thrust::device_vector<double> env1(pts_per_timewin);
-        thrust::device_vector<double> env2(pts_per_timewin);
+        // Copy envelopes to host
+        cudaMemcpy(envelope1Host, deviceEnvelope1, sizeof(double) * ptsPerTimewin, cudaMemcpyDeviceToHost);
+        cudaMemcpy(envelope2Host, deviceEnvelope2, sizeof(double) * ptsPerTimewin, cudaMemcpyDeviceToHost);
 
-        // Copy envelope data
-        thrust::copy(thrust::device_pointer_cast(d_envelope1),
-            thrust::device_pointer_cast(d_envelope1) + pts_per_timewin,
-            env1.begin());
-        thrust::copy(thrust::device_pointer_cast(d_envelope2),
-            thrust::device_pointer_cast(d_envelope2) + pts_per_timewin,
-            env2.begin());
+        cudaFree(deviceHil1);
+        cudaFree(deviceHil2);
 
         // Normalize envelopes
-        double sum1 = thrust::reduce(env1.begin(), env1.end(), 0.0);
-        double sum2 = thrust::reduce(env2.begin(), env2.end(), 0.0);
-
+        double sum1 = 0.0;
+        double sum2 = 0.0;
+        for (int j = 0; j < ptsPerTimewin; ++j) {
+            sum1 += envelope1Host[j];
+            sum2 += envelope2Host[j];
+        }
         if (sum1 > 1e-12) {
-            thrust::transform(env1.begin(), env1.end(), env1.begin(),
-                [sum1] __device__(double x) { return x / sum1; });
+            for (int j = 0; j < ptsPerTimewin; ++j) { envelope1Host[j] /= sum1; }
         }
         if (sum2 > 1e-12) {
-            thrust::transform(env2.begin(), env2.end(), env2.begin(),
-                [sum2] __device__(double x) { return x / sum2; });
+            for (int j = 0; j < ptsPerTimewin; ++j) { envelope2Host[j] /= sum2; }
         }
 
         // Calculate time dissimilarity
-        double timeDiss = thrust::transform_reduce(
-            thrust::make_zip_iterator(thrust::make_tuple(env1.begin(), env2.begin())),
-            thrust::make_zip_iterator(thrust::make_tuple(env1.end(), env2.end())),
-            [] __device__(const thrust::tuple<double, double>&t) -> double {
-            return fabs(thrust::get<0>(t) - thrust::get<1>(t));
-        },
-            0.0,
-            thrust::plus<double>()) * 0.5;
+        double timeDiss = 0.0;
+        for (int j = 0; j < ptsPerTimewin; ++j) { timeDiss += fabs(envelope1Host[j] - envelope2Host[j]); }
+        timeDiss *= 0.5;
 
-        // Calculate frequency dissimilarity
-        thrust::device_vector<double> fftA(pts_per_fft, 0.0);
-        thrust::device_vector<double> fftB(pts_per_fft, 0.0);
+        // Initialize fftAHost / fftBHost arrays to zero
+        for (int j = 0; j < ptsPerFFT; ++j) {
+            fftAHost[j] = 0.0;
+            fftBHost[j] = 0.0;
+        }
 
+        // Frequency domain dissimilarity
         for (int w = 0; w < numfftwin; ++w) {
-            int base = w * pts_per_fft;
+            int base = w * ptsPerFFT;
 
-            // Process first time chunk
-            for (int j = 0; j < pts_per_fft; ++j) {
-                fft_input_host[j].x = timechunk_matrix[i][base + j];
-                fft_input_host[j].y = 0.0;
+            // Process first time chunk FFT
+            for (int j = 0; j < ptsPerFFT; ++j) {
+                fftInputHost[j].x = timechunkMatrix[i][base + j];
+                fftInputHost[j].y = 0.0;
             }
+            cudaMemcpy(deviceFFTInput, fftInputHost, sizeof(cufftDoubleComplex) * ptsPerFFT, cudaMemcpyHostToDevice);
+            cufftExecZ2Z(fftPlan, deviceFFTInput, deviceFFTOutput, CUFFT_FORWARD);
 
-            if (cudaMemcpy(d_fft_input, fft_input_host.data(),
-                sizeof(cufftDoubleComplex) * pts_per_fft, cudaMemcpyHostToDevice) != cudaSuccess) {
-                continue;
+            fftMagnitudeKernel <<<gridFFT, block >>> (deviceFFTOutput, deviceMagnitude, ptsPerFFT);
+            cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
+
+            cudaMemcpy(magnitudeHost, deviceMagnitude, sizeof(double) * ptsPerFFT, cudaMemcpyDeviceToHost);
+
+            for (int j = 0; j < ptsPerFFT; ++j) { fftAHost[j] += magnitudeHost[j]; }
+
+            // Process second time chunk FFT
+            for (int j = 0; j < ptsPerFFT; ++j) {
+                fftInputHost[j].x = timechunkMatrix[i + 1][base + j];
+                fftInputHost[j].y = 0.0;
             }
+            cudaMemcpy(deviceFFTInput, fftInputHost, sizeof(cufftDoubleComplex) * ptsPerFFT, cudaMemcpyHostToDevice);
+            cufftExecZ2Z(fftPlan, deviceFFTInput, deviceFFTOutput, CUFFT_FORWARD);
 
-            if (cufftExecZ2Z(fft_plan, d_fft_input, d_fft_output, CUFFT_FORWARD) != CUFFT_SUCCESS) {
-                continue;
-            }
+            fftMagnitudeKernel <<<gridFFT, block >>> (deviceFFTOutput, deviceMagnitude, ptsPerFFT);
+            cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
-            fft_magnitude_kernel << <grid_fft, block >> > (d_fft_output, d_magnitude, pts_per_fft);
+            cudaMemcpy(magnitudeHost, deviceMagnitude, sizeof(double) * ptsPerFFT, cudaMemcpyDeviceToHost);
 
-            if (cudaDeviceSynchronize() != cudaSuccess) {  continue; }
-
-            // Add to fftA
-            thrust::device_vector<double> temp_mag(pts_per_fft);
-            thrust::copy(thrust::device_pointer_cast(d_magnitude),
-                thrust::device_pointer_cast(d_magnitude) + pts_per_fft,
-                temp_mag.begin());
-            thrust::transform(fftA.begin(), fftA.end(), temp_mag.begin(), fftA.begin(), thrust::plus<double>());
-
-            // Process second time chunk
-            for (int j = 0; j < pts_per_fft; ++j) {
-                fft_input_host[j].x = timechunk_matrix[i + 1][base + j];
-                fft_input_host[j].y = 0.0;
-            }
-
-            if (cudaMemcpy(d_fft_input, fft_input_host.data(),
-                sizeof(cufftDoubleComplex) * pts_per_fft, cudaMemcpyHostToDevice) != cudaSuccess) {
-                continue;
-            }
-
-            if (cufftExecZ2Z(fft_plan, d_fft_input, d_fft_output, CUFFT_FORWARD) != CUFFT_SUCCESS) {
-                continue;
-            }
-
-            fft_magnitude_kernel << <grid_fft, block >> > (d_fft_output, d_magnitude, pts_per_fft);
-
-            if (cudaDeviceSynchronize() != cudaSuccess) { continue; }
-
-            // Add to fftB
-            thrust::copy(thrust::device_pointer_cast(d_magnitude),
-                thrust::device_pointer_cast(d_magnitude) + pts_per_fft,
-                temp_mag.begin());
-            thrust::transform(fftB.begin(), fftB.end(), temp_mag.begin(), fftB.begin(), thrust::plus<double>());
+            for (int j = 0; j < ptsPerFFT; ++j) { fftBHost[j] += magnitudeHost[j]; }
         }
 
         // Normalize frequency spectra
-        double totalA = thrust::reduce(fftA.begin(), fftA.end(), 0.0);
-        double totalB = thrust::reduce(fftB.begin(), fftB.end(), 0.0);
+        double totalA = 0.0;
+        double totalB = 0.0;
+        for (int j = 0; j < ptsPerFFT; ++j) {
+            totalA += fftAHost[j];
+            totalB += fftBHost[j];
+        }
 
         if (totalA > 1e-12) {
-            thrust::transform(fftA.begin(), fftA.end(), fftA.begin(),
-                [totalA] __device__(double x) { return x / totalA; });
+            for (int j = 0; j < ptsPerFFT; ++j) { fftAHost[j] /= totalA; }
         }
         if (totalB > 1e-12) {
-            thrust::transform(fftB.begin(), fftB.end(), fftB.begin(),
-                [totalB] __device__(double x) { return x / totalB; });
+            for (int j = 0; j < ptsPerFFT; ++j) { fftBHost[j] /= totalB; }
         }
 
         // Calculate frequency dissimilarity
-        double freqDiss = thrust::transform_reduce(
-            thrust::make_zip_iterator(thrust::make_tuple(fftA.begin(), fftB.begin())),
-            thrust::make_zip_iterator(thrust::make_tuple(fftA.end(), fftB.end())),
-            [] __device__(const thrust::tuple<double, double>&t) -> double {
-            return fabs(thrust::get<0>(t) - thrust::get<1>(t));
-        },
-            0.0,
-            thrust::plus<double>()) * 0.5;
+        double freqDiss = 0.0;
+        for (int j = 0; j < ptsPerFFT; ++j) { freqDiss += fabs(fftAHost[j] - fftBHost[j]); }
+        freqDiss *= 0.5;
 
-        diss[i] = timeDiss * freqDiss;
+        diss[i] = timeDiss * freqDiss; // Combine time / frequency dissimilarity
     }
 
-    // Final cleanup
-    cudaFree(d_fft_input);
-    cudaFree(d_fft_output);
-    cudaFree(d_magnitude);
-    cudaFree(d_envelope1);
-    cudaFree(d_envelope2);
-    cufftDestroy(fft_plan);
+    // Cleanup
+    delete[] hil1Host;
+    delete[] hil2Host;
+    delete[] fftInputHost;
+    delete[] envelope1Host;
+    delete[] envelope2Host;
+    delete[] magnitudeHost;
+    delete[] fftAHost;
+    delete[] fftBHost;
+
+    cudaFree(deviceFFTInput);
+    cudaFree(deviceFFTOutput);
+    cudaFree(deviceMagnitude);
+    cudaFree(deviceEnvelope1);
+    cudaFree(deviceEnvelope2);
+
+    cufftDestroy(fftPlan);
 
     return diss;
 }
 
+// Free allocated memory for audio samples
 void freeAudioData(AudioData& audio) {
-    for (int ch = 0; ch < audio.numChannels; ++ch) { delete[] audio.samples[ch]; }
-    delete[] audio.samples;
+    for (int ch = 0; ch < audio.numChannels; ++ch) { delete[] audio.samples[ch]; } // Deallocate each channel
+    delete[] audio.samples; // Deallocate top level array
 }
 
+// Free allocated memory for extracted features
 void freeAudioFeatures(AudioFeatures& features) {
+    // Free 1D feature arrays
     delete[] features.segmentDuration;
     delete[] features.SPLrms;
     delete[] features.SPLpk;
     delete[] features.impulsivity;
     delete[] features.dissim;
-    delete[] features.peakcount;
-
-    if (features.autocorr) {
-        for (int i = 0; i < features.autocorrRows; ++i) { delete[] features.autocorr[i]; }
-        delete[] features.autocorr;
-    }
+    delete[] features.peakCount;
+    
+    for (int i = 0; i < features.autocorrRows; ++i) { delete[] features.autocorr[i]; } // Deallocate each row of autocorr
+    delete[] features.autocorr; // Deallocate top layer array
 
     // Reset pointers
     features.segmentDuration = nullptr;
@@ -1107,165 +1015,173 @@ void freeAudioFeatures(AudioFeatures& features) {
     features.SPLpk = nullptr;
     features.impulsivity = nullptr;
     features.dissim = nullptr;
-    features.peakcount = nullptr;
+    features.peakCount = nullptr;
     features.autocorr = nullptr;
 }
 
-__global__ void convertToPressureKernel(
-    const double* samples, double* pressure, int numSamples,
-    int num_bits, double peak_volts, double refSens) {
+__global__ void convertToPressureKernel(const double* samples, double* pressure, int numSamples,
+            int numBits, double peakVolts, double refSens) {
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= numSamples) { return; }
+    int index = blockIdx.x * blockDim.x + threadIdx.x; // Global thread index
+    if (index >= numSamples) { return; } // Exit if out of bounds
 
-    double s = samples[idx];
+    double samp = samples[index]; // Read sample
 
-    if (num_bits == 24) { s = static_cast<double>(static_cast<int>(s) >> 8); }
-    else if (num_bits == 32) { s = static_cast<double>(static_cast<int>(s) >> 16); }
+    // Right shift align
+    if (numBits == 24) { samp = static_cast<double>(static_cast<int>(samp) >> 8); }
+    else if (numBits == 32) { samp = static_cast<double>(static_cast<int>(samp) >> 16); }
 
-    pressure[idx] = s * (peak_volts / static_cast<double>(1 << num_bits)) * (1.0 / pow(10.0, refSens / 20.0));
+    // Convert to pressure
+    pressure[index] = samp * (peakVolts / static_cast<double>(1 << numBits)) * (1.0 / pow(10.0, refSens / 20.0));
 }
 
-void gpu_convert_to_pressure(
-    const double* h_samples, double* h_pressure, int length,
-    int num_bits, double peak_volts, double refSens) {
+void gpuConvertToPressure(const double* hostSamples, double* hostPressure, int length,
+            int numBits, double peakVolts, double refSens) {
 
-    double* d_samples;
-    double* d_pressure;
-    cudaMalloc(&d_samples, sizeof(double) * length);
-    cudaMalloc(&d_pressure, sizeof(double) * length);
+    double* deviceSamples;
+    double* devicePressure;
+    cudaMalloc(&deviceSamples, sizeof(double) * length);
+    cudaMalloc(&devicePressure, sizeof(double) * length);
 
-    cudaMemcpy(d_samples, h_samples, sizeof(double) * length, cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceSamples, hostSamples, sizeof(double) * length, cudaMemcpyHostToDevice); // Copy samples to device
 
+    // CUDA launch configuration
     int threadsPerBlock = 256;
     int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
-    convertToPressureKernel << <blocks, threadsPerBlock >> > (
-        d_samples, d_pressure, length, num_bits, peak_volts, refSens);
+    convertToPressureKernel <<<blocks, threadsPerBlock >>> (deviceSamples, devicePressure, length, numBits, peakVolts, refSens);
 
-    cudaMemcpy(h_pressure, d_pressure, sizeof(double) * length, cudaMemcpyDeviceToHost);
-    cudaFree(d_samples);
-    cudaFree(d_pressure);
+    cudaMemcpy(hostPressure, devicePressure, sizeof(double) * length, cudaMemcpyDeviceToHost); // Copy pressure to host
+    
+    // Cleanup
+    cudaFree(deviceSamples);
+    cudaFree(devicePressure);
 }
 
 // Main feature extraction
-AudioFeatures feature_extraction(int num_bits, int peak_volts, const fs::path& file_path,
-    double refSens, int timewin, double avtime, int fft_win,
-    int calTone, int flow, int fhigh, int downsample_factor, bool omit_partial_minute) {
+AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& filePath,
+            double refSens, int timewin, double avtime, int fftWin, int calTone, int flow,
+            int fhigh, int downsampleFactor, bool omitPartialMinute) {
 
-    string fixed_file_path = fixFilePath(file_path.string());
-    AudioInfo info = audioread_info(fixed_file_path);
+    string fixedFilePath = fixFilePath(filePath.string()); // Make file path Windows compatible
+    AudioInfo info = audioReadInfo(fixedFilePath); // Read audio metadata
 
-    if (omit_partial_minute) { info.duration = floor(info.duration / 60.0) * 60.0; }
+    if (omitPartialMinute) { info.duration = floor(info.duration / 60.0) * 60.0; } // Only include full minutes of recordings
 
-    int total_samples = static_cast<int>(info.sampleRate * info.duration);
-    AudioData audio = audioread(file_path.string(), SampleRange{ 1, total_samples });
+    int totalSamples = static_cast<int>(info.sampleRate * info.duration); // # of samples
+    AudioData audio = audioRead(filePath.string(), SampleRange{ 1, totalSamples }); // Load audio data
 
-    int fs = audio.sampleRate;
-    int audioSamplesLen = audio.numFrames;
+    int sampFreq = audio.sampleRate; // Sampling frequency
+    int audioSamplesLen = audio.numFrames; // # of audio frames
 
-    double* pressure = nullptr;
-    try { pressure = new double[audioSamplesLen]; }
-    catch (bad_alloc& e) {
-        AudioFeatures empty_features = {};
-        return empty_features;
-    }
+    double* pressure = new double[audioSamplesLen]; // Buffer for pressure waveform
 
-    double* flat_samples = audio.samples[0];
-    gpu_convert_to_pressure(flat_samples, pressure, audioSamplesLen, num_bits, peak_volts, refSens);
-    freeAudioData(audio);
+    double* flatSamples = audio.samples[0]; // First channel
+    gpuConvertToPressure(flatSamples, pressure, audioSamplesLen, numBits, peakVolts, refSens); // Convert to pressure (Pascals)
+    freeAudioData(audio); // Deallocate original audio data
 
-    if (downsample_factor != -1) {
+    if (downsampleFactor != -1) { // Downsample
         int newLen = 0;
-        double* downsampled = downsample(pressure, audioSamplesLen, downsample_factor, newLen);
+        double* downsampled = downSample(pressure, audioSamplesLen, downsampleFactor, newLen);
         delete[] pressure;
         pressure = downsampled;
         audioSamplesLen = newLen;
-        fs /= downsample_factor;
+        sampFreq /= downsampleFactor;
     }
 
-    if (calTone == 1 && audioSamplesLen > 6 * fs) {
-        int newLen = audioSamplesLen - 6 * fs;
+    if (calTone == 1 && audioSamplesLen > 6 * sampFreq) { // Remove first six seconds if calibration tone is present
+        int newLen = audioSamplesLen - 6 * sampFreq;
         double* shifted = new double[newLen];
-        memcpy(shifted, pressure + 6 * fs, sizeof(double) * newLen);
+        memcpy(shifted, pressure + 6 * sampFreq, sizeof(double) * newLen);
         delete[] pressure;
         pressure = shifted;
         audioSamplesLen = newLen;
     }
 
-    BandpassFilter filt = bandpass_filter(pressure, audioSamplesLen, 1.0 / fs, flow, fhigh);
+    BandpassFilter filt = bandpassFilter(pressure, audioSamplesLen, 1.0 / sampFreq, flow, fhigh); // Apply bandpass filter
     delete[] pressure;
 
-    int pts_per_timewin = timewin * fs;
-    int num_timewin = filt.length / pts_per_timewin;
-    int remainder = filt.length % pts_per_timewin;
-    if (remainder > 0) { ++num_timewin; }
+    // Segment length (samples) / # of time windows
+    int ptsPerTimeWin = timewin * sampFreq;
+    int numTimeWin = filt.length / ptsPerTimeWin;
+    int remainder = filt.length % ptsPerTimeWin;
+    if (remainder > 0) { ++numTimeWin; } // Padded segment for leftover samples
 
-    int padded_len = num_timewin * pts_per_timewin;
-    double* padded_signal = new double[padded_len]();
-    memcpy(padded_signal, filt.filteredTimeSeries, sizeof(double) * filt.length);
+    // Pad filtered signal to match time window
+    int paddedLen = numTimeWin * ptsPerTimeWin;
+    double* paddedSignal = new double[paddedLen]();
+    // Include padding for consistent row / column lengths
+    memcpy(paddedSignal, filt.filteredTimeSeries, sizeof(double) * filt.length);
 
+    // Populate audio features struct
     AudioFeatures features = {};
-    features.segmentDurationLen = num_timewin;
-    features.segmentDuration = new int[num_timewin];
+    features.segmentDurationLen = numTimeWin;
+    features.segmentDuration = new int[numTimeWin];
 
-    double** timechunk_matrix = new double* [num_timewin];
-    for (int i = 0; i < num_timewin; ++i) {
-        timechunk_matrix[i] = &padded_signal[i * pts_per_timewin];
-        features.segmentDuration[i] = (i == num_timewin - 1 && remainder > 0)
-            ? static_cast<int>(round(static_cast<double>(remainder) / fs)) : timewin;
+    // Signal to time windows
+    double** timechunkMatrix = new double* [numTimeWin];
+    for (int i = 0; i < numTimeWin; ++i) {
+        timechunkMatrix[i] = &paddedSignal[i * ptsPerTimeWin];
+        // Duration per segment
+        if (i == numTimeWin - 1 && remainder > 0)
+        { features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq));}
+        else { features.segmentDuration[i] = timewin; }
     }
 
-    features.SPLrmsLen = features.SPLpkLen = features.impulsivityLen = num_timewin;
-    features.SPLrms = new double[num_timewin];
-    features.SPLpk = new double[num_timewin];
-    features.impulsivity = new double[num_timewin];
+    // Allocate space for features
+    features.SPLrmsLen = features.SPLpkLen = features.impulsivityLen = numTimeWin;
+    features.SPLrms = new double[numTimeWin];
+    features.SPLpk = new double[numTimeWin];
+    features.impulsivity = new double[numTimeWin];
 
-    for (int i = 0; i < num_timewin; ++i) {
-        const double* chunk = timechunk_matrix[i];
-        double sumsq = 0.0, peak = 0.0;
-        for (int j = 0; j < pts_per_timewin; ++j) {
-            double v = chunk[j];
-            sumsq += v * v;
-            peak = fabs(v) > peak ? fabs(v) : peak;
+    // Calculate SPLrms, SPLpk, / impulsivity for each time segment
+    for (int i = 0; i < numTimeWin; ++i) {
+        const double* chunk = timechunkMatrix[i];
+        double sumSq = 0.0, peak = 0.0;
+        for (int j = 0; j < ptsPerTimeWin; ++j) {
+            double temp = chunk[j];
+            sumSq += temp * temp;
+            if (fabs(temp) > peak) { peak = fabs(temp); }
         }
-        double rms = sqrt(sumsq / pts_per_timewin);
+        double rms = sqrt(sumSq / ptsPerTimeWin);
         features.SPLrms[i] = 20.0 * log10(max(rms, 1e-12));
         features.SPLpk[i] = 20.0 * log10(max(peak, 1e-12));
-        features.impulsivity[i] = calculate_kurtosis(chunk, pts_per_timewin);
+        features.impulsivity[i] = calculateKurtosis(chunk, ptsPerTimeWin);
     }
 
-    SoloPerGM2 gm2 = f_solo_per_GM2(padded_signal, padded_len, fs, timewin, avtime);
+    // Calculate autocorr / peakcount
+    SoloPerGM2 gm2 = fSoloPerGM2(paddedSignal, paddedLen, sampFreq, timewin, avtime);
 
-    features.peakcountLen = num_timewin;
-    features.peakcount = new int[num_timewin];
-    for (int i = 0; i < num_timewin; ++i) {
-        features.peakcount[i] = gm2.peakcount[i];
-    }
-    delete[] gm2.peakcount;
+    features.peakCountLen = numTimeWin;
+    features.peakCount = new int[numTimeWin];
+    for (int i = 0; i < numTimeWin; ++i) { features.peakCount[i] = gm2.peakCount[i]; }
+    delete[] gm2.peakCount;
 
-    features.autocorrRows = gm2.autocorr_rows;
-    features.autocorrCols = gm2.autocorr_cols;
-    features.autocorr = new double* [gm2.autocorr_rows];
-    for (int i = 0; i < gm2.autocorr_rows; ++i) { features.autocorr[i] = gm2.autocorr[i]; }
+    features.autocorrRows = gm2.autocorrRows;
+    features.autocorrCols = gm2.autocorrCols;
+    features.autocorr = new double* [gm2.autocorrRows];
+    for (int i = 0; i < gm2.autocorrRows; ++i) { features.autocorr[i] = gm2.autocorr[i]; }
     delete[] gm2.autocorr;
 
-    int dissim_len = 0;
-    features.dissim = f_solo_dissim_GM1_gpu(timechunk_matrix, pts_per_timewin, num_timewin, fft_win, fs, dissim_len);
-    features.dissimLen = dissim_len;
+    // Calculate dissim
+    int dissimLen = 0;
+    features.dissim = fSoloDissimGM1GPU(timechunkMatrix, ptsPerTimeWin, numTimeWin, fftWin, sampFreq, dissimLen);
+    features.dissimLen = dissimLen;
 
-    delete[] timechunk_matrix;
-    delete[] padded_signal;
+    // Deallocate temporary arrays
+    delete[] timechunkMatrix;
+    delete[] paddedSignal;
 
     return features;
 }
 
+// Copy input file name to output file record
 tm extractBaseTime(const string& filename) {
     tm baseTime = {}; // Fields initialized to zero
-    smatch match;
+    smatch match; // Will store matched part
     regex pattern(R"((\d{8})_(\d{6}))"); // Matches YYYYMMDD_HHMMSS
 
     // Find date / time from file name
-    if (regex_search(filename, match, pattern) && match.size() == 3) {
+    if (regex_search(filename, match, pattern) && match.size() == 3) { // Date / time / full match
         string date = match[1]; // Date
         string time = match[2]; // Time
 
@@ -1283,7 +1199,7 @@ tm extractBaseTime(const string& filename) {
 // Export saved features to CSV file
 void saveFeaturesToCSV(const char* filename, const char** filenames, int numFiles, const AudioFeatures* allFeatures) {
     ofstream outputFile(filename);
-    if (!outputFile.is_open()) {
+    if (!outputFile.is_open()) { // Error opening file
         cerr << "Error: Unable to open output file: " << filename << endl;
         return;
     }
@@ -1300,17 +1216,17 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
         }
     }
 
-    // Allocate array for valid autocorr columns
+    // Allocate array for valid autocorr columns - Avoids printing empty columns
     bool* validAutocorrCols = new bool[maxAutocorrCols];
-    for (int j = 0; j < maxAutocorrCols; ++j) { validAutocorrCols[j] = false; }
+    for (int i = 0; i < maxAutocorrCols; ++i) { validAutocorrCols[i] = false; }
 
     // Remove extra autocorr columns
     for (int i = 0; i < numFiles; ++i) {
         const AudioFeatures& feature = allFeatures[i];
         if (feature.autocorr != nullptr) {
-            for (int r = 0; r < feature.autocorrRows; ++r) {
-                for (int c = 0; c < feature.autocorrCols; ++c) {
-                    if (!isnan(feature.autocorr[r][c])) { validAutocorrCols[c] = true; }
+            for (int row = 0; row < feature.autocorrRows; ++row) {
+                for (int col = 0; col < feature.autocorrCols; ++col) {
+                    if (!isnan(feature.autocorr[row][col])) { validAutocorrCols[col] = true; }
                 }
             }
         }
@@ -1318,31 +1234,36 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
 
     // CSV Header
     outputFile << "Filename,Year,Month,Day,Hour,Minute,SegmentDuration,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount";
-    for (int j = 0; j < maxAutocorrCols; ++j) {
-        if (validAutocorrCols[j]) { outputFile << ",Autocorr_" << j; }
+    for (int i = 0; i < maxAutocorrCols; ++i) {
+        if (validAutocorrCols[i]) { outputFile << ",Autocorr_" << i; }
     }
     outputFile << "\n";
 
-    // Write data
+    // Write one row per time segment for each file
     for (int fileIdx = 0; fileIdx < numFiles; ++fileIdx) {
         const AudioFeatures& features = allFeatures[fileIdx];
 
-        int maxLength = max({ features.SPLrmsLen, features.SPLpkLen, features.impulsivityLen,
-                features.dissimLen, features.peakcountLen });
+        // Find max length of features (Most features are length n, dissim is n - 1)
+        int maxLength = features.SPLrmsLen;
 
+        // Convert timestamp to time_t
         tm baseTime = extractBaseTime(filenames[fileIdx]);
         time_t baseEpoch = mktime(&baseTime);
         tm* firstTime = localtime(&baseEpoch);
 
+        // Use NaN for empty indices - Only applies to dissim
         bool useNanTimestamp = false;
         if (!firstTime || (firstTime->tm_year + 1900) < 1900) { useNanTimestamp = true; }
 
+        // Iterate through segments
         for (int i = 0; i < maxLength; ++i) {
+            // Calculate timestamp per minute
             time_t currentEpoch = baseEpoch + i * 60;
             tm* currentTime = localtime(&currentEpoch);
 
             outputFile << filenames[fileIdx] << ",";
 
+            // Write timestamp or NaN
             if (useNanTimestamp || !currentTime) {  outputFile << "NaN,NaN,NaN,NaN,NaN,"; }
             else {
                 outputFile << (currentTime->tm_year + 1900) << ","
@@ -1352,29 +1273,36 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                            << currentTime->tm_min << ",";
             }
 
+            // Segment duration
             if (i < features.segmentDurationLen) { outputFile << features.segmentDuration[i]; }
             else { outputFile << "NaN"; }
             outputFile << ",";
 
+            // SPLrms
             if (i < features.SPLrmsLen) outputFile << features.SPLrms[i];
             else { outputFile << "NaN"; }
             outputFile << ",";
 
+            // SPLpk
             if (i < features.SPLpkLen) outputFile << features.SPLpk[i];
             else { outputFile << "NaN"; }
             outputFile << ",";
 
+            // Impulsivity
             if (i < features.impulsivityLen) outputFile << features.impulsivity[i];
             else { outputFile << "NaN"; }
             outputFile << ",";
 
+            // Dissim
             if (i < features.dissimLen) outputFile << features.dissim[i];
             else { outputFile << "NaN"; }
             outputFile << ",";
 
-            if (i < features.peakcountLen) outputFile << features.peakcount[i];
+            // Peakcount
+            if (i < features.peakCountLen) outputFile << features.peakCount[i];
             else { outputFile << "NaN"; }
             
+            // Autocorr
             for (int j = 0; j < maxAutocorrCols; ++j) {
                 if (validAutocorrCols[j]) {
                     outputFile << ",";
@@ -1383,7 +1311,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                 }
             }
 
-            outputFile << "\n";
+            outputFile << "\n"; // End of row
         }
     }
 
@@ -1392,38 +1320,38 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
     outputFile.close();
 }
 
-// Worker thread function
-void threadWork(atomic<int>& nextIndex, int totalFiles, char filePaths[][512], AudioFeatures* allFeatures,
-                char filenames[][512], int num_bits, int peak_volts, double RS, int timewin, double avtime,
-                int fft_win, int arti, int flow, int fhigh, int downsample, bool omit_partial_minute) {
-    while (true) {
-        int index = nextIndex++;
-        if (index >= totalFiles) { break; }
-
-        // Convert the raw C-string to filesystem::path
-        fs::path filepath(filePaths[index]);
-
-        // Extract filename as string / copy to filenames[]
-        string fname = filepath.filename().string();
-        strncpy(filenames[index], fname.c_str(), 511);
-        filenames[index][511] = '\0'; // Ensure null-termination
-
-        // Extract features from recordings
-        allFeatures[index] = feature_extraction(
-            num_bits, peak_volts, filepath, RS,
-            timewin, avtime, fft_win, arti,
-            flow, fhigh, downsample, omit_partial_minute);
-    }
+// Sort input files
+int compareStrings(const void* ptrA, const void* ptrB) { // Sort strings alphabetically
+    // Dereference to get real string names
+    const char* str1 = *(const char**)ptrA;
+    const char* str2 = *(const char**)ptrB;
+    return strcmp(str1, str2); // Return string in alphabetical order
 }
 
-void bubbleSort(char arr[][512], int n) {
-    char temp[512];
-    for (int i = 0; i < n-1; ++i) {
-        for (int j = 0; j < n-i-1; ++j) {
-            if (strcmp(arr[j], arr[j+1]) > 0) {
-                strcpy(temp, arr[j]);
-                strcpy(arr[j], arr[j+1]);
-                strcpy(arr[j+1], temp);
+void quickSortStrings(char arr[][512], int numFiles) {
+    // Create an array of pointers for use with qsort
+    char* ptrs[512];
+    for (int i = 0; i < numFiles; ++i) {
+        ptrs[i] = arr[i]; // Pointers to strings
+    }
+
+    // Sort pointers
+    qsort(ptrs, numFiles, sizeof(char*), compareStrings);
+
+    // Rearrange original array based on sorted pointers
+    char temp[512]; // Buffer for swapping string contents
+    for (int i = 0; i < numFiles; ++i) {
+        if (ptrs[i] != arr[i]) { // Pointer not in correct location
+            strcpy(temp, ptrs[i]); // Move sorted string to temp buffer
+            strcpy(ptrs[i], arr[i]); // Move unsorted string to new location
+            strcpy(arr[i], temp); // Move string from temp to current index
+
+            // Update array for future swaps
+            for (int j = i + 1; j < numFiles; ++j) {
+                if (ptrs[j] == arr[i]) {
+                    ptrs[j] = ptrs[i]; // Fix pointer inconsistency
+                    break;
+                }
             }
         }
     }
@@ -1431,164 +1359,147 @@ void bubbleSort(char arr[][512], int n) {
 
 void threadWrapper(ThreadArgs& args) {
     try {
-        while (true) {
-            int idx = args.nextIndex->fetch_add(1);
-            if (idx >= args.totalFiles) { break; }
+        while (true) { // Find next index
+            int index = args.nextIndex->fetch_add(1);
+            if (index >= args.totalFiles) { break; } // End of input files
 
-            cout << "Processing file index " << idx << ": " << args.filePaths[idx] << "\n";
+            // Display current file being processed
+            cout << "Processing file index " << index << ": " << args.filePaths[index] << "\n";
             cerr.flush();
 
-            fs::path file_path(args.filePaths[idx]);
+            fs::path filePath(args.filePaths[index]);
 
-            AudioFeatures features = feature_extraction(
-                args.num_bits,
-                args.peak_volts,
-                file_path,
-                args.RS,
-                args.timewin,
-                args.avtime,
-                args.fft_win,
-                args.arti,
-                args.flow,
-                args.fhigh,
-                args.downsample,
-                args.omit_partial_minute
-            );
+            // Perform feature extraction for current input file
+            AudioFeatures features = featureExtraction(args.numBits, args.peakVolts,
+                    filePath, args.RS, args.timeWin, args.avTime, args.fftWin,
+                    args.arti, args.fLow, args.fHigh, args.downSample, args.omitPartialMinute);
 
-            args.allFeatures[idx] = features;
+            args.allFeatures[index] = features;
 
-            string filename_str = file_path.filename().string();
-            strncpy(args.filenames[idx], filename_str.c_str(), 511);
-            args.filenames[idx][511] = '\0';
+            // Display base filename in output results
+            string filename_str = filePath.filename().string();
+            strncpy(args.filenames[index], filename_str.c_str(), 511);
+            args.filenames[index][511] = '\0'; // Null terminate for safe handling
         }
     }
-    catch (const exception& e) {
-        cerr << "Exception in thread: " << e.what() << "\n";
-    }
-    catch (...) {
-        cerr << "Unknown exception in thread\n";
-    }
+
+    // Display any errors
+    catch (const exception& e) { cerr << "Exception in thread: " << e.what() << "\n"; }
+    catch (...) { cerr << "Unknown exception in thread\n"; }
 }
 
 // Process directory of sound files with user-given parameters
 int main(int argc, char* argv[]) {
-    using namespace std;
-    using namespace chrono;
+    using namespace std; // Standard namespace
+    using namespace chrono; // Time tracking
 
-    auto start = high_resolution_clock::now();
+    auto start = high_resolution_clock::now(); // Starting time to show runtime performance
 
-    // Defaults
-    char input_dir[512] = {}, output_file[512] = {};
-    int num_bits = 16, peak_volts = 2, arti = 1;
-    int timewin = 60, fft_win = 1, flow = 1, fhigh = 192000;
-    double RS = -178.3, avtime = 0.1;
-    int max_threads = 4, downsample = -1;
-    bool omit_partial_minute = false;
+    // Default arguments if unspecified
+    char inputDir[512] = {}, outputFile[512] = {};
+    int numBits = 16, peakVolts = 2, arti = 1, timeWin = 60, fftWin = 1,
+            fLow = 1, fHigh = 192000, maxThreads = 4, downSample = -1;
+    double RS = -178.3, avTime = 0.1;
+    bool omitPartialMinute = false;
 
-    // CLI Parsing
+    // Command line index parsing
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--omit_partial_minute") == 0) { omit_partial_minute = true; }
-        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) { strncpy(input_dir, argv[++i], sizeof(input_dir) - 1); }
-        else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) { strncpy(output_file, argv[++i], sizeof(output_file) - 1); }
-        else if (strcmp(argv[i], "--num_bits") == 0) { num_bits = atoi(argv[++i]); }
+        if (strcmp(argv[i], "--omit_partial_minute") == 0) { omitPartialMinute = true; }
+        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) { strncpy(inputDir, argv[++i], sizeof(inputDir) - 1); }
+        else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) { strncpy(outputFile, argv[++i], sizeof(outputFile) - 1); }
+        else if (strcmp(argv[i], "--num_bits") == 0) { numBits = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--RS") == 0) { RS = atof(argv[++i]); }
-        else if (strcmp(argv[i], "--peak_volts") == 0) { peak_volts = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--peak_volts") == 0) { peakVolts = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--arti") == 0) { arti = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--timewin") == 0) { timewin = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--fft_win") == 0) { fft_win = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--avtime") == 0) { avtime = atof(argv[++i]); }
-        else if (strcmp(argv[i], "--flow") == 0) { flow = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--fhigh") == 0) { fhigh = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--max_threads") == 0) { max_threads = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--downsample") == 0) { downsample = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--timewin") == 0) { timeWin = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--fft_win") == 0) { fftWin = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--avtime") == 0) { avTime = atof(argv[++i]); }
+        else if (strcmp(argv[i], "--flow") == 0) { fLow = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--fhigh") == 0) { fHigh = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--max_threads") == 0) { maxThreads = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--downsample") == 0) { downSample = atoi(argv[++i]); }
     }
 
-    // Allocate heap memory for large arrays
-    auto filePaths = new char[MAX_FILES][512];
-    auto filenames = new char[MAX_FILES][512];
-    auto allFeatures = new AudioFeatures[MAX_FILES];
-
+    // Count .wav files
     int totalFiles = 0;
-
-    for (const auto& entry : fs::directory_iterator(input_dir)) {
-        if (entry.path().extension() == ".wav") {
-            if (totalFiles >= MAX_FILES) {
-                cerr << "Too many .wav files. Increase MAX_FILES.\n";
-                delete[] filePaths;
-                delete[] filenames;
-                delete[] allFeatures;
-                return 1;
-            }
-            strncpy(filePaths[totalFiles], entry.path().string().c_str(), 511);
-            filePaths[totalFiles][511] = '\0'; // Null terminate
-            totalFiles++;
-        }
+    for (const auto& entry : fs::directory_iterator(inputDir)) {
+        if (entry.path().extension() == ".wav") { ++totalFiles; }
     }
 
-    if (totalFiles == 0) {
-        cerr << "No valid .wav files found in " << input_dir << "\n";
-        delete[] filePaths;
-        delete[] filenames;
-        delete[] allFeatures;
+    if (totalFiles == 0) { // Empty directory
+        cerr << "No valid .wav files found in " << inputDir << "\n";
         return 1;
     }
 
-    bubbleSort(filePaths, totalFiles);
+    // Allocate arrays with dynamic size now that totalFiles is known
+    char (*filePaths)[512] = new char[totalFiles][512]; // Path to files
+    char (*filenames)[512] = new char[totalFiles][512]; // Base filenames
+    AudioFeatures* allFeatures = new AudioFeatures[totalFiles];
 
+    // Fill filePaths with file names
+    int index = 0;
+    for (const auto& entry : fs::directory_iterator(inputDir)) {
+        if (entry.path().extension() == ".wav") {
+            strncpy(filePaths[index], entry.path().string().c_str(), 511);
+            filePaths[index][511] = '\0';
+            ++index;
+        }
+    }
+
+    quickSortStrings(filePaths, totalFiles); // Sort file paths alphabetically for in-order data processing
+
+    // Thread setup
     atomic<int> nextIndex(0);
-    int availableThreads = max(1u, thread::hardware_concurrency());
-    int numThreads = min(max_threads, availableThreads);
+    int availableThreads = max(1, thread::hardware_concurrency());
+    int numThreads = min(maxThreads, availableThreads);
 
-    if (fhigh <= 16000 && numThreads > 2) { numThreads = 2; }
-    else if (fhigh <= 48000 && numThreads > 4) { numThreads = 4; }
+    // Limit thread count depending on high frequency cutoff
+    if (fHigh <= 16000 && numThreads > 2) { numThreads = 2; }
+    else if (fHigh <= 48000 && numThreads > 4) { numThreads = 4; }
 
-    // Prepare thread args
+    // Thread arguments
     ThreadArgs args;
     args.nextIndex = &nextIndex;
     args.totalFiles = totalFiles;
     args.filePaths = filePaths;
     args.filenames = filenames;
     args.allFeatures = allFeatures;
-    args.num_bits = num_bits;
-    args.peak_volts = peak_volts;
+    args.numBits = numBits;
+    args.peakVolts = peakVolts;
     args.RS = RS;
-    args.timewin = timewin;
-    args.avtime = avtime;
-    args.fft_win = fft_win;
+    args.timeWin = timeWin;
+    args.avTime = avTime;
+    args.fftWin = fftWin;
     args.arti = arti;
-    args.flow = flow;
-    args.fhigh = fhigh;
-    args.downsample = downsample;
-    args.omit_partial_minute = omit_partial_minute;
+    args.fLow = fLow;
+    args.fHigh = fHigh;
+    args.downSample = downSample;
+    args.omitPartialMinute = omitPartialMinute;
 
     // Launch threads
-    vector<thread> threads;
-    for (int i = 0; i < numThreads; ++i) { threads.emplace_back(threadWrapper, ref(args)); }
-    for (auto& t : threads) { t.join(); }
+    thread* threads = new thread[numThreads];
+    for (int i = 0; i < numThreads; ++i) { threads[i] = thread(threadWrapper, ref(args)); }
+    for (int i = 0; i < numThreads; ++i) { threads[i].join(); }
+    delete[] threads;
 
-    // Save to CSV
-    vector<const char*> file_names(totalFiles);
-    for (int i = 0; i < totalFiles; ++i) { file_names[i] = filenames[i]; }
+    const char** fileNames = new const char* [totalFiles];
+    for (int i = 0; i < totalFiles; ++i) { fileNames[i] = filenames[i]; } // Convert to const char* array
 
-    saveFeaturesToCSV(output_file, file_names.data(), totalFiles, allFeatures);
-    cout << "Saved features for " << totalFiles << " files to " << output_file << "\n";
+    saveFeaturesToCSV(outputFile, fileNames, totalFiles, allFeatures);
+    cout << "Saved features for " << totalFiles << " files to " << outputFile << "\n";
+
+    for (int i = 0; i < totalFiles; ++i) { freeAudioFeatures(allFeatures[i]); } // Free featurees for each file
 
     // Cleanup
-    for (int i = 0; i < totalFiles; ++i) { freeAudioFeatures(allFeatures[i]); }
-
     delete[] filePaths;
     delete[] filenames;
     delete[] allFeatures;
+    delete[] fileNames;
+    fftw_cleanup(); // Clean up internal memory
 
-    fftw_cleanup();
-
-    auto stop = high_resolution_clock::now();
-
-    using chrono::duration;
-    using chrono::duration_cast;
-
+    auto stop = high_resolution_clock::now(); // Ending time to show runtime performance
     duration<double> elapsed = duration_cast<duration<double>>(stop - start);
-    cout << "Runtime: " << elapsed.count() << " seconds\n";
+    cout << "Runtime: " << elapsed.count() << " seconds\n"; // Total execution time
 
     return 0;
 }
