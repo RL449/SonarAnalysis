@@ -54,7 +54,7 @@ The user specifies the following parameters:
 
 - High frequency cutoff (Hz)
 
-OptionalParameters
+Optional parameters:
 - Maximum number of threads
 
 - Downsampling factor
