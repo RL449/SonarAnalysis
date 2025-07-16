@@ -1,4 +1,5 @@
 This program has been converted from MATLAB code (written by Grant Milne and Dylan Wilford) into C++. It is designed to use multithreading to make data processing more time-efficient and available on Windows platforms, without requiring a MATLAB license.
+Note: Save this as a file that allows non-ASCII characters, i.e. Unicode (UTF-8 without signature) - Codepage 65001 in Visual Studio.
 
 This program reads from a directory of .wav files and produces a .csv file containing the following columns:
 
@@ -29,7 +30,7 @@ This program reads from a directory of .wav files and produces a .csv file conta
 - Autocorrelation
 
 
-The user specified the following parameters:
+The user specifies the following parameters:
 
 - Input directory
 
@@ -53,21 +54,28 @@ The user specified the following parameters:
 
 - High frequency cutoff (Hz)
 
+OptionalParameters
 - Maximum number of threads
 
-- Downsampling factor (No downsampling if unspecified)
+- Downsampling factor
 
-- Omission of incomplete minutes (No ommission if unspecified)
+- Omission of incomplete minutes
 
 File names in the input directory are assumed to be on contain a timestamp with the format "YYYYMMDD_HHMMSS".
-File names without this format will generate invalid outputted date/time columns.
+File names without this format will generate "NaN" date/time columns.
 
-The required libraries for this program are sndfile and fftw3.
+Ensure these libraries are available and properly linked:
+- sndfile
+
+- fftw3
+
+- cufft
+
+- cudart
 
 Compilation:
-g++ -o main_original.exe main_original.cpp -IC:\path\to\fftw3.h\and\sndfile.h -LC:\path\to\fftw3.lib\and\and\sndfile.lib -lsndfile -lfftw3
+nvcc -std=c++17 --extended-lambda -Xcompiler "/MT" -DCCCL_IGNORE_DEPRECATED_CPP_DIALECT -o main_original.exe main_original.cu -I"C:\path\to\vcpkg\installed\x64-windows\include" -L"C:\path\to\vcpkg\installed\x64-windows\lib" -I"C:\path\to\NVIDIA GPU Computing Toolkit\CUDA\version number\include" -L"C:\path\to\NVIDIA GPU Computing Toolkit\CUDA\version number\lib\x64" -lsndfile -lfftw3 -lcufft -lcudart --Wno-deprecated-gpu-targets -Xlinker /SUBSYSTEM:CONSOLE
 
 Run program:
-main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\output\directory\output_filename.csv" --num_bits # --RS -# --peak_volts # --arti # --timewin # --fft_win # --avtime # --flow # --fhigh # --max_threads # --omit_partial_minute (optional)
-
+main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\output\directory\output_filename.csv" --num_bits # --RS -# --peak_volts # --arti # --timewin # --fft_win # --avtime # --flow # --fhigh # --max_threads # --downsample # --omit_partial_minute
 
