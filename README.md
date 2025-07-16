@@ -81,4 +81,4 @@ nvcc -std=c++17 --extended-lambda -Xcompiler "/MT" -DCCCL_IGNORE_DEPRECATED_CPP_
 Run program:
 main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\output\directory\output_filename.csv" --num_bits # --RS -# --peak_volts # --arti # --timewin # --fft_win # --avtime # --flow # --fhigh # --max_threads # --downsample # --omit_partial_minute
 Ex:
-main_original.exe --input "C:\Users\rlessard\Desktop\ValDrixAudio" --output "C:\Users\rlessard\Desktop\runThisOutput\cpp_output_ValDrixAudio.csv" --num_bits 24 --RS -178.3 --peak_volts 1 --arti 0 --timewin 60 --fft_win 1 --avtime 0.1 --flow 1 --fhigh 128000 --max_threads 1
+main_original.exe --input "C:\Users\rlessard\Desktop\ValDrixAudio" --output "C:\Users\rlessard\Desktop\runThisOutput\cpp_output_ValDrixAudio.csv" --num_bits 24 --RS -178.3 --peak_volts 2 --arti 0 --timewin 60 --fft_win 1 --avtime 0.1 --flow 1 --fhigh 128000 --max_threads 1 --downsample 2 --omit_partial_minute
