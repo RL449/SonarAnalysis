@@ -96,10 +96,6 @@ struct AudioData {
     double** samples; // 2D array of audio samples [channel][frame]
     int numChannels; // # of audio channels
     int numFrames; // # of frames per channel
-    int sampleRate; // Sample rate (Hz)
-};
-
-struct AudioInfo {
     int sampleRate; // Sampling rate (Hz)
     double duration; // Duration of audio (seconds)
 };
@@ -175,96 +171,88 @@ string fixFilePath(const string& path) {
     return fixedPath;
 }
 
-// Read audio samples / extract recording metadata
-AudioData audioRead(const string& filename, SampleRange range = {1, -1}) {
-    SNDFILE* file; // Sound file
-    SF_INFO sfinfo = {}; // Sound metadata
+// Read audio samples from files
+AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
+    SF_INFO sfinfo = {};
+    SNDFILE* file = sf_open(filename.c_str(), SFM_READ, &sfinfo);
 
-    file = sf_open(filename.c_str(), SFM_READ, &sfinfo); // Open file in read mode
-    if (!file) { throw runtime_error("Error opening audio file: " + string(sf_strerror(file))); }
+    if (!file) {
+        throw runtime_error("Error opening audio file: " + string(sf_strerror(file)));
+    }
 
-    // Sample range to read
-    int totalFrames = sfinfo.frames; // Frames per channel
+    int totalFrames = sfinfo.frames;
     int endSample;
-    if (range.endSample == -1) { endSample = totalFrames; } // No range specified
+    if (range.endSample == -1) { endSample = totalFrames; }
     else { endSample = min(range.endSample, totalFrames); }
-    
-    int startSample = max(0, range.startSample - 1); // Zero based indexing
+    int startSample = max(0, range.startSample - 1);
     int numFramesToRead = endSample - startSample;
 
-    if (numFramesToRead <= 0) { // Invalid arguments provided
+    if (numFramesToRead <= 0) {
         sf_close(file);
         throw runtime_error("Invalid sample range");
     }
 
-    sf_seek(file, startSample, SEEK_SET); // Starting frame in sound file
+    sf_seek(file, startSample, SEEK_SET);
 
-    int numChannels = sfinfo.channels; // # of audio channels
-    double* interleavedSamples = new double[numFramesToRead * numChannels]; // Samples from all channels
+    int numChannels = sfinfo.channels;
+    double* interleavedSamples = new double[numFramesToRead * numChannels];
 
-    int format = sfinfo.format & SF_FORMAT_SUBMASK; // Determine bit depth
+    int format = sfinfo.format & SF_FORMAT_SUBMASK;
 
     switch (format) {
-        case SF_FORMAT_PCM_16: { // 16 bit
-            short* tempBuffer = new short[numFramesToRead * numChannels];
-            sf_readf_short(file, tempBuffer, numFramesToRead); // Read into temporary short buffer
-            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(tempBuffer[i]); }
-            delete[] tempBuffer; // Clean up temp buffer
-            break;
+    case SF_FORMAT_PCM_16: {
+        short* tempBuffer = new short[numFramesToRead * numChannels];
+        sf_readf_short(file, tempBuffer, numFramesToRead);
+        for (int i = 0; i < numFramesToRead * numChannels; ++i) {
+            interleavedSamples[i] = static_cast<double>(tempBuffer[i]);
         }
-        case SF_FORMAT_PCM_24:
-        case SF_FORMAT_PCM_32: { // 24 or 32 bit
-            int* tempBuffer = new int[numFramesToRead * numChannels];
-            sf_readf_int(file, tempBuffer, numFramesToRead); // Read into temporary int buffer
-            for (int i = 0; i < numFramesToRead * numChannels; ++i) { interleavedSamples[i] = static_cast<double>(tempBuffer[i]); }
-            delete[] tempBuffer; // Clean up temp buffer
-            break;
+        delete[] tempBuffer;
+        break;
+    }
+    case SF_FORMAT_PCM_24:
+    case SF_FORMAT_PCM_32: {
+        int* tempBuffer = new int[numFramesToRead * numChannels];
+        sf_readf_int(file, tempBuffer, numFramesToRead);
+        for (int i = 0; i < numFramesToRead * numChannels; ++i) {
+            interleavedSamples[i] = static_cast<double>(tempBuffer[i]);
         }
-        default:
-            // Unsupported bit depth
-            sf_close(file);
-            delete[] interleavedSamples;
-            throw runtime_error("Unsupported bit format");
+        delete[] tempBuffer;
+        break;
+    }
+    default:
+        sf_close(file);
+        delete[] interleavedSamples;
+        throw runtime_error("Unsupported bit format");
     }
 
-    sf_close(file); // Reading complete
+    sf_close(file);
 
-    // Channel data matrix: one array per channel
-    double** samples = new double*[numChannels];
-    for (int ch = 0; ch < numChannels; ++ch) { samples[ch] = new double[numFramesToRead]; }
+    // Deinterleave samples
+    double** samples = new double* [numChannels];
+    for (int ch = 0; ch < numChannels; ++ch) {
+        samples[ch] = new double[numFramesToRead];
+    }
 
-    // De-interleave sample buffer into one array per channel
-    // Separate indices per channel
     for (int i = 0; i < numFramesToRead; ++i) {
-        for (int ch = 0; ch < numChannels; ++ch) { samples[ch][i] = interleavedSamples[i * numChannels + ch]; }
+        for (int ch = 0; ch < numChannels; ++ch) {
+            samples[ch][i] = interleavedSamples[i * numChannels + ch];
+        }
     }
 
-    delete[] interleavedSamples; // Deallocate interleaved buffer
+    delete[] interleavedSamples;
 
-    return AudioData{samples, numChannels, numFramesToRead, sfinfo.samplerate}; // Metadata
-}
+    double duration = static_cast<double>(sfinfo.frames) / sfinfo.samplerate;
 
-AudioInfo audioReadInfo(const string& filePath) {
-    SF_INFO sfInfo = {0}; // Struct containing sound metadata (frames, samplerate, channels, format)
-    SNDFILE* file = sf_open(filePath.c_str(), SFM_READ, &sfInfo); // Open audio file in read mode
-
-    if (!file) { throw runtime_error("Error opening audio file: " + filePath); } // Error opening file
-
-    int sampleRate = sfInfo.samplerate; // Get sample rate
-    int numFrames = sfInfo.frames; // Get # of frames
-    float duration = static_cast<float>(numFrames) / sampleRate; // Calculate duration (seconds)
-
-    sf_close(file); // Close file after reading info
-
-    return {sampleRate, duration};
+    return AudioData{ samples, numChannels, numFramesToRead, sfinfo.samplerate, duration };
 }
 
 __global__ void downsampleKernel(const double* x, double* result, int length, int factor) {
     int index = blockIdx.x * blockDim.x + threadIdx.x; // Compute global index of thread
-    if (index * factor < length) { result[index] = x[index * factor]; } // Determine if downsampled data is in input bounds
+    // Determine if downsampled data is in input bounds
+    if (index * factor < length) { result[index] = x[index * factor]; }
 }
 
-// Reduce sampling rate by analyzing (1 / factor) samples
+// Reduce sampling rate by for comparison between recordings with different frequencies
 double* downSample(const double* x, int length, int factor, int& newLength) {
     if (factor <= 0) { throw invalid_argument("Factor must be positive"); } // Validate input
 
@@ -276,7 +264,8 @@ double* downSample(const double* x, int length, int factor, int& newLength) {
     cudaMalloc(&deviceInput, sizeof(double) * length);
     cudaMalloc(&deviceOutput, sizeof(double) * newLength);
 
-    cudaMemcpy(deviceInput, x, sizeof(double) * length, cudaMemcpyHostToDevice); // Copy input signal from host to device
+    // Copy input signal from host to device
+    cudaMemcpy(deviceInput, x, sizeof(double) * length, cudaMemcpyHostToDevice);
 
     // Launch kernel
     int threads = 256; // # of threads per block
@@ -284,7 +273,8 @@ double* downSample(const double* x, int length, int factor, int& newLength) {
     downsampleKernel <<<blocks, threads >>> (deviceInput, deviceOutput, length, factor);
 
     double* result = new double[newLength]; // Allocate memory on host
-    cudaMemcpy(result, deviceOutput, sizeof(double) * newLength, cudaMemcpyDeviceToHost); // Copy downsampled result to host
+    // Copy downsampled result to host
+    cudaMemcpy(result, deviceOutput, sizeof(double) * newLength, cudaMemcpyDeviceToHost);
 
     // Deallocate GPU memory
     cudaFree(deviceInput);
@@ -300,7 +290,8 @@ __global__ void fftShiftKernel(const double* input, double* shifted, int length)
 }
 
 // CUDA kernel to compute shifted frequency array / apply bandpass filter
-__global__ void applyBandpassFilter(cufftDoubleComplex* freqData, int numPoints, double freqStep, double fLow, double fHigh) {
+__global__ void applyBandpassFilter(cufftDoubleComplex* freqData, int numPoints,
+            double freqStep, double fLow, double fHigh) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numPoints) { return; }
 
@@ -318,13 +309,15 @@ __global__ void applyBandpassFilter(cufftDoubleComplex* freqData, int numPoints,
 }
 
 // CUDA kernel to normalize inverse FFT / compute amplitude spectrum
-__global__ void normalizeAndComputeAmplitude(const cufftDoubleComplex* timeData, double* outputTime, double* outputAmp, int numPoints) {
+__global__ void normalizeAndComputeAmplitude(const cufftDoubleComplex* timeData, double* outputTime,
+            double* outputAmp, int numPoints) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numPoints) { return; }
 
     double norm = 1.0 / numPoints;
     outputTime[i] = timeData[i].x * norm; // Normalize inverse FFT real output
-    outputAmp[i] = sqrt(timeData[i].x * timeData[i].x + timeData[i].y * timeData[i].y); // Compute magnitude at each point
+    // Compute magnitude at each point
+    outputAmp[i] = sqrt(timeData[i].x * timeData[i].x + timeData[i].y * timeData[i].y);
 }
 
 // Apply bandpass filter in frequency domain
@@ -339,7 +332,9 @@ BandpassFilter bandpassFilter(const double* timeSeries, int numPts, double frequ
         hostInput[i].x = timeSeries[i];
         hostInput[i].y = 0.0;
     }
-    cudaMemcpy(deviceFreqData, hostInput, sizeof(cufftDoubleComplex) * numPts, cudaMemcpyHostToDevice); // Copy frequency data to device
+
+    // Copy frequency data to device
+    cudaMemcpy(deviceFreqData, hostInput, sizeof(cufftDoubleComplex) * numPts, cudaMemcpyHostToDevice);
     delete[] hostInput; // Free host memory
 
     // Execute forward FFT
@@ -373,8 +368,9 @@ BandpassFilter bandpassFilter(const double* timeSeries, int numPts, double frequ
     // Copy results to host
     double* timeSeriesFilt = new double[numPts];
     double* amplitudeSpectrum = new double[numPts];
-    cudaMemcpy(timeSeriesFilt, deviceTimeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost); // Copy time series data to host
-    cudaMemcpy(amplitudeSpectrum, deviceAmplitudeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost); // Copy magnitude spectrum to host
+    // Copy magnitude spectrum and time series data to host
+    cudaMemcpy(timeSeriesFilt, deviceTimeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost);
+    cudaMemcpy(amplitudeSpectrum, deviceAmplitudeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost);
 
     // Cleanup
     cufftDestroy(planForward);
@@ -472,7 +468,8 @@ double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
 
     // Reduce fourth moment array to scalar value / sum values in parallel
     thrust::device_ptr<double> fourthPtr(deviceFourth);
-    double fourthMoment = thrust::reduce(fourthPtr, fourthPtr + pointsPerTimeWin, 0.0, thrust::plus<double>()) / pointsPerTimeWin;
+    double fourthMoment = thrust::reduce(fourthPtr, fourthPtr + pointsPerTimeWin, 0.0,
+            thrust::plus<double>()) / pointsPerTimeWin;
 
     // Cleanup
     cudaFree(deviceData);
@@ -487,7 +484,8 @@ double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
 __global__ void envelopeKernel(const cufftDoubleComplex* hilbert, double* envelope, int pointsPerTimeWin) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     // Compute magnitude for idx
-    if (index < pointsPerTimeWin) { envelope[index] = sqrt(hilbert[index].x * hilbert[index].x + hilbert[index].y * hilbert[index].y); }
+    if (index < pointsPerTimeWin)
+        { envelope[index] = sqrt(hilbert[index].x * hilbert[index].x + hilbert[index].y * hilbert[index].y); }
 }
 
 // CUDA kernel for correlation computation
@@ -538,7 +536,8 @@ __global__ void correlationKernel(const double* real, const double* imaginary, i
 // CUDA kernel for FFT magnitude calculation
 __global__ void fftMagnitudeKernel(const cufftDoubleComplex* fftData, double* magnitude, int pointsPerFFT) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < pointsPerFFT) { magnitude[idx] = sqrt(fftData[idx].x * fftData[idx].x + fftData[idx].y * fftData[idx].y); } // Calculate magnitude
+    // Calculate magnitude
+    if (idx < pointsPerFFT) { magnitude[idx] = sqrt(fftData[idx].x * fftData[idx].x + fftData[idx].y * fftData[idx].y); }
 }
 
 // GPU-accelerated correlation function
@@ -547,20 +546,20 @@ Correlation correl5GPU(const double* timeSeries1, const double* timeSeries2,
     int len = lags + 1;
     
     // Allocate GPU memory
-    double * deviceReal, * deviceImaginary, * deviceCorrVals;
-    cudaMalloc(&deviceReal, sizeof(double) * seriesLength);
-    cudaMalloc(&deviceImaginary, sizeof(double) * seriesLength);
+    double * deviceInputSignal1, * deviceInputSignal2, * deviceCorrVals;
+    cudaMalloc(&deviceInputSignal1, sizeof(double) * seriesLength);
+    cudaMalloc(&deviceInputSignal2, sizeof(double) * seriesLength);
     cudaMalloc(&deviceCorrVals, sizeof(double) * len);
     
-    // Copy deviceReal / deviceImaginary to device
-    cudaMemcpy(deviceReal, timeSeries1, sizeof(double) * seriesLength, cudaMemcpyHostToDevice);
-    cudaMemcpy(deviceImaginary, timeSeries2, sizeof(double) * seriesLength, cudaMemcpyHostToDevice);
+    // Copy deviceInputSignal1 / deviceInputSignal2 to device
+    cudaMemcpy(deviceInputSignal1, timeSeries1, sizeof(double) * seriesLength, cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceInputSignal2, timeSeries2, sizeof(double) * seriesLength, cudaMemcpyHostToDevice);
     
     // Launch correlation kernel
     // Specify dimensions
     dim3 block(256);
-    dim3 grid((len + block.x - 1) / block.x);
-    correlationKernel<<<grid, block>>>(deviceReal, deviceImaginary, seriesLength, deviceCorrVals, lags, offset);
+    dim3 grid((len + block.x - 1) / block.x); // All data points covered by threads
+    correlationKernel<<<grid, block>>>(deviceInputSignal1, deviceInputSignal2, seriesLength, deviceCorrVals, lags, offset);
     cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
     
     // Allocate host memory
@@ -573,8 +572,8 @@ Correlation correl5GPU(const double* timeSeries1, const double* timeSeries2,
     for (int i = 0; i < len; ++i) { lagVals[i] = static_cast<double>(i); }
     
     // Cleanup GPU memory
-    cudaFree(deviceReal);
-    cudaFree(deviceImaginary);
+    cudaFree(deviceInputSignal1);
+    cudaFree(deviceInputSignal2);
     cudaFree(deviceCorrVals);
     
     return Correlation(corrVals, lagVals, len);
@@ -592,7 +591,8 @@ __global__ void squareAndSegment(const double* input, double* output, int sampWi
 }
 
 // Kernel to average squared values
-__global__ void computeAverages(const double* squared, double* outputAvg, int sampWindowSize, int avgWinSize, int numavwin, int numTimeWins) {
+__global__ void computeAverages(const double* squared, double* outputAvg, int sampWindowSize,
+            int avgWinSize, int numavwin, int numTimeWins) {
     int segIndex = blockIdx.x; // Segment index
     int win = threadIdx.x; // Averaging window index
 
@@ -629,11 +629,12 @@ SoloPerGM2 fSoloPerGM2(const double* pFiltInput, int inputLength, double fs, dou
     squareAndSegment <<<blocks, threads >>> (deviceInput, deviceSquared, sampWindowSize, numTimeWins);
 
     // Calculate average of squared values
-    computeAverages <<<numTimeWins, numAvWin >>> (deviceSquared, deviceAvg, sampWindowSize, avgWinSize, numAvWin, numTimeWins);
+    computeAverages <<<numTimeWins, numAvWin >>> (deviceSquared, deviceAvg, sampWindowSize,
+            avgWinSize, numAvWin, numTimeWins);
 
     // Copy averages back to host
     double* hostAvg = new double[numTimeWins * numAvWin];
-    cudaMemcpy(hostAvg, deviceAvg, numTimeWins * numAvWin * sizeof(double), cudaMemcpyDeviceToHost); // Copy averages to host
+    cudaMemcpy(hostAvg, deviceAvg, numTimeWins * numAvWin * sizeof(double), cudaMemcpyDeviceToHost);
 
     // Outputs for correlation / peak count
     int pAvTotRows = numAvWin;
@@ -646,6 +647,7 @@ SoloPerGM2 fSoloPerGM2(const double* pFiltInput, int inputLength, double fs, dou
     // Iterate through time windows - Calculate autocorr / peak count
     for (int i = 0; i < pAvTotCols; i++) {
         // Calculate correlation
+        cudaSetDevice(0);
         Correlation corrResult = correl5GPU(&hostAvg[i * numAvWin], &hostAvg[i * numAvWin], pAvTotRows, lagLimit, 0);
         acorr[i] = new double[lagLimit + 1];
         for (int j = 0; j <= lagLimit; ++j) { acorr[i][j] = corrResult.correlationValues[j]; }
@@ -658,7 +660,8 @@ SoloPerGM2 fSoloPerGM2(const double* pFiltInput, int inputLength, double fs, dou
                 double leftMin = acorr[i][j];
                 for (int k = j - 1; k >= 0 && acorr[i][k] < acorr[i][j]; k--) { leftMin = min(leftMin, acorr[i][k]); }
                 double rightMin = acorr[i][j];
-                for (int k = j + 1; k <= lagLimit && acorr[i][k] < acorr[i][j]; k++) { rightMin = min(rightMin, acorr[i][k]); }
+                for (int k = j + 1; k <= lagLimit && acorr[i][k] < acorr[i][j]; k++)
+                    { rightMin = min(rightMin, acorr[i][k]); }
                 double prominence = acorr[i][j] - max(leftMin, rightMin);
                 if (prominence > 0.5) { peakCount++; } // Threshold reached
             }
@@ -683,7 +686,7 @@ SoloPerGM2 fSoloPerGM2(const double* pFiltInput, int inputLength, double fs, dou
     return result;
 }
 
-// CUDA kernel for Hilbert transform filter application
+// Zeroes out negative frequencies and doubles positive frequencies to create frequency signal
 __global__ void hilbertFilterKernel(cufftDoubleComplex* data, int len) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= len) { return; }
@@ -704,7 +707,7 @@ __global__ void hilbertFilterKernel(cufftDoubleComplex* data, int len) {
     }
 }
 
-// Convert real input to complex
+// Convert real input to complex array
 __global__ void initializeComplex(double* input, cufftDoubleComplex* output, int len) {
     int threadIndex = blockIdx.x * blockDim.x + threadIdx.x; // Global thread index
     if (threadIndex < len) {
@@ -713,7 +716,7 @@ __global__ void initializeComplex(double* input, cufftDoubleComplex* output, int
     }
 }
 
-// Normalize inverse FFT result
+// Normalize inverse FFT result to preserve signal amplitude
 __global__ void normalizeResult(cufftDoubleComplex* data, int len) {
     int threadIndex = blockIdx.x * blockDim.x + threadIdx.x; // Global thread index
     if (threadIndex < len) {
@@ -722,7 +725,7 @@ __global__ void normalizeResult(cufftDoubleComplex* data, int len) {
     }
 }
 
-// Calculate analytic signal using hilbert transform with FFT
+// Converts real values to complex analytic signal using FFT
 fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
     if (!input || inputLen <= 0) { // Validate input
         cerr << "Invalid input\n";
@@ -739,7 +742,7 @@ fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
     // Convert to complex
     // Specify dimensions
     dim3 block(256);
-    dim3 grid((inputLen + block.x - 1) / block.x);
+    dim3 grid((inputLen + block.x - 1) / block.x); // All data points covered by threads
     initializeComplex <<<grid, block >>> (deviceIinput, deviceData, inputLen);
     cudaFree(deviceIinput); // Free deviceIinput early
 
@@ -764,7 +767,8 @@ fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
         return nullptr;
     }
 
-    cudaMemcpy(result, deviceData, sizeof(cufftDoubleComplex) * inputLen, cudaMemcpyDeviceToHost); // Copy results to host
+    // Copy results to host
+    cudaMemcpy(result, deviceData, sizeof(cufftDoubleComplex) * inputLen, cudaMemcpyDeviceToHost);
 
     // Cleanup
     cudaFree(deviceData);
@@ -773,7 +777,7 @@ fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
     return result;
 }
 
-// Calculate dissimilarity with GPU
+// Perform per-window envelope comparisons with hilbert transofrms and FFTs to calculate dissimilarity
 double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTimeWin,
             double fftWin, double fs, int& outLen) {
 
@@ -839,13 +843,15 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
 
     // Specify dimensions
     dim3 block(256);
-    dim3 gridFFT((ptsPerFFT + block.x - 1) / block.x);
+    dim3 gridFFT((ptsPerFFT + block.x - 1) / block.x); // All data points covered by threads
     dim3 gridEnv((ptsPerTimewin + block.x - 1) / block.x);
 
     // Iterate over adjacent pairs of time chunks
     for (int i = 0; i < outLen; ++i) {
         // Calculate analytic signals
+        cudaSetDevice(0);
         fftw_complex* hil1 = hilbertRawGPU(timechunkMatrix[i], ptsPerTimewin);
+        cudaSetDevice(0);
         fftw_complex* hil2 = hilbertRawGPU(timechunkMatrix[i + 1], ptsPerTimewin);
 
         if (!hil1 || !hil2) { // Failed hilbert computations
@@ -1048,7 +1054,8 @@ void gpuConvertToPressure(const double* hostSamples, double* hostPressure, int l
     // CUDA launch configuration
     int threadsPerBlock = 256;
     int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
-    convertToPressureKernel <<<blocks, threadsPerBlock >>> (deviceSamples, devicePressure, length, numBits, peakVolts, refSens);
+    convertToPressureKernel <<<blocks, threadsPerBlock >>> (deviceSamples, devicePressure,
+            length, numBits, peakVolts, refSens);
 
     cudaMemcpy(hostPressure, devicePressure, sizeof(double) * length, cudaMemcpyDeviceToHost); // Copy pressure to host
     
@@ -1059,16 +1066,11 @@ void gpuConvertToPressure(const double* hostSamples, double* hostPressure, int l
 
 // Main feature extraction
 AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& filePath,
-            double refSens, int timewin, double avtime, int fftWin, int calTone, int flow,
-            int fhigh, int downsampleFactor, bool omitPartialMinute) {
+    double refSens, int timewin, double avtime, int fftWin, int calTone, int flow,
+    int fhigh, int downsampleFactor, bool omitPartialMinute) {
 
     string fixedFilePath = fixFilePath(filePath.string()); // Make file path Windows compatible
-    AudioInfo info = audioReadInfo(fixedFilePath); // Read audio metadata
-
-    if (omitPartialMinute) { info.duration = floor(info.duration / 60.0) * 60.0; } // Only include full minutes of recordings
-
-    int totalSamples = static_cast<int>(info.sampleRate * info.duration); // # of samples
-    AudioData audio = audioRead(filePath.string(), SampleRange{ 1, totalSamples }); // Load audio data
+    AudioData audio = audioRead(filePath.string()); // Read all samples and metadata
 
     int sampFreq = audio.sampleRate; // Sampling frequency
     int audioSamplesLen = audio.numFrames; // # of audio frames
@@ -1076,28 +1078,45 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     double* pressure = new double[audioSamplesLen]; // Buffer for pressure waveform
 
     double* flatSamples = audio.samples[0]; // First channel
-    gpuConvertToPressure(flatSamples, pressure, audioSamplesLen, numBits, peakVolts, refSens); // Convert to pressure (Pascals)
+    // Convert to pressure (Pascals)
+    cudaSetDevice(0);
+    gpuConvertToPressure(flatSamples, pressure, audioSamplesLen, numBits, peakVolts, refSens);
     freeAudioData(audio); // Deallocate original audio data
 
     if (downsampleFactor != -1) { // Downsample
         int newLen = 0;
-        double* downsampled = downSample(pressure, audioSamplesLen, downsampleFactor, newLen);
-        delete[] pressure;
+        double* downsampled = downSample(pressure, audioSamplesLen, downsampleFactor, newLen); // Shortened array
+        delete[] pressure; // Deallocate longer array
         pressure = downsampled;
         audioSamplesLen = newLen;
         sampFreq /= downsampleFactor;
     }
 
-    if (calTone == 1 && audioSamplesLen > 6 * sampFreq) { // Remove first six seconds if calibration tone is present
+    if ((calTone == 1 && audioSamplesLen > 6 * sampFreq)) { // Remove first six seconds if calibration tone is present
         int newLen = audioSamplesLen - 6 * sampFreq;
-        double* shifted = new double[newLen];
+        double* shifted = new double[newLen]; // Shortened array
         memcpy(shifted, pressure + 6 * sampFreq, sizeof(double) * newLen);
-        delete[] pressure;
+        delete[] pressure; // Deallocate longer array
         pressure = shifted;
         audioSamplesLen = newLen;
     }
 
-    BandpassFilter filt = bandpassFilter(pressure, audioSamplesLen, 1.0 / sampFreq, flow, fhigh); // Apply bandpass filter
+    // Only include full minutes of recordings
+    if ((omitPartialMinute)) {
+        double currentDuration = static_cast<double>(audioSamplesLen) / sampFreq;
+        double fullMinutesDuration = floor(currentDuration / 60.0) * 60.0; // Find full minutes
+        int croppedFrames = static_cast<int>(sampFreq * fullMinutesDuration); // # of frames for full minutes
+        if (croppedFrames < audioSamplesLen) { // Trim if full minutes < total time
+            double* trimmed = new double[croppedFrames]; // Allocate space for full minute
+            memcpy(trimmed, pressure, sizeof(double) * croppedFrames); // Only include full minutes
+            delete[] pressure; // Delete original array
+            pressure = trimmed; // Set samples to only include full minutes
+            audioSamplesLen = croppedFrames; // Update metadata
+        }
+    }
+
+    // Apply bandpass filter
+    BandpassFilter filt = bandpassFilter(pressure, audioSamplesLen, 1.0 / sampFreq, flow, fhigh);
     delete[] pressure;
 
     // Segment length (samples) / # of time windows
@@ -1111,6 +1130,8 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     double* paddedSignal = new double[paddedLen]();
     // Include padding for consistent row / column lengths
     memcpy(paddedSignal, filt.filteredTimeSeries, sizeof(double) * filt.length);
+    delete[] filt.filteredTimeSeries;
+    filt.filteredTimeSeries = nullptr;
 
     // Populate audio features struct
     AudioFeatures features = {};
@@ -1123,7 +1144,9 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
         timechunkMatrix[i] = &paddedSignal[i * ptsPerTimeWin];
         // Duration per segment
         if (i == numTimeWin - 1 && remainder > 0)
-        { features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq));}
+        {
+            features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq));
+        }
         else { features.segmentDuration[i] = timewin; }
     }
 
@@ -1164,6 +1187,7 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
 
     // Calculate dissim
     int dissimLen = 0;
+    cudaSetDevice(0);
     features.dissim = fSoloDissimGM1GPU(timechunkMatrix, ptsPerTimeWin, numTimeWin, fftWin, sampFreq, dissimLen);
     features.dissimLen = dissimLen;
 
@@ -1306,7 +1330,8 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
             for (int j = 0; j < maxAutocorrCols; ++j) {
                 if (validAutocorrCols[j]) {
                     outputFile << ",";
-                    if (features.autocorr && i < features.autocorrRows && j < features.autocorrCols) { outputFile << features.autocorr[i][j]; }
+                    if (features.autocorr && i < features.autocorrRows && j < features.autocorrCols)
+                        { outputFile << features.autocorr[i][j]; }
                     else { outputFile << "NaN"; }
                 }
             }
@@ -1321,37 +1346,14 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
 }
 
 // Sort input files
-int compareStrings(const void* ptrA, const void* ptrB) { // Sort strings alphabetically
-    // Dereference to get real string names
-    const char* str1 = *(const char**)ptrA;
-    const char* str2 = *(const char**)ptrB;
-    return strcmp(str1, str2); // Return string in alphabetical order
-}
-
-void quickSortStrings(char arr[][512], int numFiles) {
-    // Create an array of pointers for use with qsort
-    char* ptrs[512];
-    for (int i = 0; i < numFiles; ++i) {
-        ptrs[i] = arr[i]; // Pointers to strings
-    }
-
-    // Sort pointers
-    qsort(ptrs, numFiles, sizeof(char*), compareStrings);
-
-    // Rearrange original array based on sorted pointers
-    char temp[512]; // Buffer for swapping string contents
-    for (int i = 0; i < numFiles; ++i) {
-        if (ptrs[i] != arr[i]) { // Pointer not in correct location
-            strcpy(temp, ptrs[i]); // Move sorted string to temp buffer
-            strcpy(ptrs[i], arr[i]); // Move unsorted string to new location
-            strcpy(arr[i], temp); // Move string from temp to current index
-
-            // Update array for future swaps
-            for (int j = i + 1; j < numFiles; ++j) {
-                if (ptrs[j] == arr[i]) {
-                    ptrs[j] = ptrs[i]; // Fix pointer inconsistency
-                    break;
-                }
+void bubbleSort(char arr[][512], int n) {
+    char temp[512]; // Buffer for swapping strings
+    for (int i = 0; i < n - 1; ++i) { // Iterate through array
+        for (int j = 0; j < n - i - 1; ++j) { // Compare adjacent elements up to unsorted portion
+            if (strcmp(arr[j], arr[j + 1]) > 0) { // Compare adjacent strings
+                strcpy(temp, arr[j]);
+                strcpy(arr[j], arr[j + 1]);
+                strcpy(arr[j + 1], temp);
             }
         }
     }
@@ -1394,6 +1396,11 @@ int main(int argc, char* argv[]) {
     using namespace chrono; // Time tracking
 
     auto start = high_resolution_clock::now(); // Starting time to show runtime performance
+
+    // Use first available GPU
+    int deviceCount = 0;
+    cudaGetDeviceCount(&deviceCount);
+    cudaSetDevice(0);
 
     // Default arguments if unspecified
     char inputDir[512] = {}, outputFile[512] = {};
@@ -1446,16 +1453,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    quickSortStrings(filePaths, totalFiles); // Sort file paths alphabetically for in-order data processing
-
+    bubbleSort(filePaths, totalFiles); // Sort file paths alphabetically for in-order data processing
+    
     // Thread setup
     atomic<int> nextIndex(0);
     int availableThreads = max(1, thread::hardware_concurrency());
     int numThreads = min(maxThreads, availableThreads);
-
-    // Limit thread count depending on high frequency cutoff
-    if (fHigh <= 16000 && numThreads > 2) { numThreads = 2; }
-    else if (fHigh <= 48000 && numThreads > 4) { numThreads = 4; }
 
     // Thread arguments
     ThreadArgs args;
