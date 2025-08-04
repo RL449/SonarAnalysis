@@ -795,7 +795,7 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
         return nullptr;
     }
 
-    outLen = numTimeWin - 1; // # of outputs
+    outLen = numTimeWin; // # of outputs
 
     // CUFFT plan
     cufftHandle fftPlan;
@@ -831,6 +831,8 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
     // Allocate host result array
     double* diss = new double[outLen];
 
+    diss[0] = NAN; // No previous record for comparison
+
     // Temporary buffers for hilbert / fft inputs
     cufftDoubleComplex* hil1Host = new cufftDoubleComplex[ptsPerTimewin];
     cufftDoubleComplex* hil2Host = new cufftDoubleComplex[ptsPerTimewin];
@@ -847,12 +849,12 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
     dim3 gridEnv((ptsPerTimewin + block.x - 1) / block.x);
 
     // Iterate over adjacent pairs of time chunks
-    for (int i = 0; i < outLen; ++i) {
+    for (int i = 1; i < outLen; ++i) { // diss[0] already NAN
         // Calculate analytic signals
         cudaSetDevice(0);
-        fftw_complex* hil1 = hilbertRawGPU(timechunkMatrix[i], ptsPerTimewin);
+        fftw_complex* hil1 = hilbertRawGPU(timechunkMatrix[i - 1], ptsPerTimewin);
         cudaSetDevice(0);
-        fftw_complex* hil2 = hilbertRawGPU(timechunkMatrix[i + 1], ptsPerTimewin);
+        fftw_complex* hil2 = hilbertRawGPU(timechunkMatrix[i], ptsPerTimewin);
 
         if (!hil1 || !hil2) { // Failed hilbert computations
             diss[i] = NAN;
@@ -938,7 +940,7 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
 
             // Process second time chunk FFT
             for (int j = 0; j < ptsPerFFT; ++j) {
-                fftInputHost[j].x = timechunkMatrix[i + 1][base + j];
+                fftInputHost[j].x = timechunkMatrix[i - 1][base + j];
                 fftInputHost[j].y = 0.0;
             }
             cudaMemcpy(deviceFFTInput, fftInputHost, sizeof(cufftDoubleComplex) * ptsPerFFT, cudaMemcpyHostToDevice);
@@ -1079,7 +1081,6 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
 
     double* flatSamples = audio.samples[0]; // First channel
     // Convert to pressure (Pascals)
-    cudaSetDevice(0);
     gpuConvertToPressure(flatSamples, pressure, audioSamplesLen, numBits, peakVolts, refSens);
     freeAudioData(audio); // Deallocate original audio data
 
@@ -1187,7 +1188,6 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
 
     // Calculate dissim
     int dissimLen = 0;
-    cudaSetDevice(0);
     features.dissim = fSoloDissimGM1GPU(timechunkMatrix, ptsPerTimeWin, numTimeWin, fftWin, sampFreq, dissimLen);
     features.dissimLen = dissimLen;
 
@@ -1360,6 +1360,21 @@ void bubbleSort(char arr[][512], int n) {
 }
 
 void threadWrapper(ThreadArgs& args) {
+    // CRITICAL: Set CUDA device for this thread FIRST, before any CUDA operations
+    cudaError_t err = cudaSetDevice(0);
+    if (err != cudaSuccess) {
+        cerr << "Failed to set CUDA device in thread: " << cudaGetErrorString(err) << "\n";
+        return;
+    }
+
+    // Verify the device is properly set
+    int currentDevice;
+    err = cudaGetDevice(&currentDevice);
+    if (err != cudaSuccess || currentDevice != 0) {
+        cerr << "CUDA device not properly set in thread. Current device: " << currentDevice << "\n";
+        return;
+    }
+
     try {
         while (true) { // Find next index
             int index = args.nextIndex->fetch_add(1);
@@ -1373,8 +1388,8 @@ void threadWrapper(ThreadArgs& args) {
 
             // Perform feature extraction for current input file
             AudioFeatures features = featureExtraction(args.numBits, args.peakVolts,
-                    filePath, args.RS, args.timeWin, args.avTime, args.fftWin,
-                    args.arti, args.fLow, args.fHigh, args.downSample, args.omitPartialMinute);
+                filePath, args.RS, args.timeWin, args.avTime, args.fftWin,
+                args.arti, args.fLow, args.fHigh, args.downSample, args.omitPartialMinute);
 
             args.allFeatures[index] = features;
 
@@ -1384,10 +1399,16 @@ void threadWrapper(ThreadArgs& args) {
             args.filenames[index][511] = '\0'; // Null terminate for safe handling
         }
     }
-
     // Display any errors
-    catch (const exception& e) { cerr << "Exception in thread: " << e.what() << "\n"; }
-    catch (...) { cerr << "Unknown exception in thread\n"; }
+    catch (const exception& e) {
+        cerr << "Exception in thread: " << e.what() << "\n";
+    }
+    catch (...) {
+        cerr << "Unknown exception in thread\n";
+    }
+
+    // Optional: Reset device at thread exit (good practice)
+    cudaDeviceReset();
 }
 
 // Process directory of sound files with user-given parameters
@@ -1400,7 +1421,15 @@ int main(int argc, char* argv[]) {
     // Use first available GPU
     int deviceCount = 0;
     cudaGetDeviceCount(&deviceCount);
-    cudaSetDevice(0);
+    if (deviceCount < 1) {
+        fprintf(stderr, "No CUDA devices available.\n");
+        exit(EXIT_FAILURE);
+    }
+    int deviceID = 0;
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, deviceID);
+    printf("Using device %d: %s\n", deviceID, prop.name);
+    cudaSetDevice(deviceID);
 
     // Default arguments if unspecified
     char inputDir[512] = {}, outputFile[512] = {};
