@@ -84,3 +84,6 @@ main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\outp
 
 Ex:
 main_original.exe --input "C:\Users\rlessard\Desktop\ValDrixAudio" --output "C:\Users\rlessard\Desktop\runThisOutput\cpp_output_ValDrixAudio.csv" --num_bits 24 --RS -178.3 --peak_volts 2 --arti 0 --timewin 60 --fft_win 1 --avtime 0.1 --flow 1 --fhigh 128000 --max_threads 1 --downsample 2 --omit_partial_minute
+
+Notes:
+It is assumed that the date/time in file names is the time at which recording began.
