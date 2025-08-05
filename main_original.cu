@@ -14,6 +14,7 @@
 #include <cassert> // Debugging
 #include <regex> // Parse date / time
 #include <ctime> // Output time formatting
+#include <iomanip> // Setfill, setw
 
 // Limit thread count to # of cores
 #include <queue> // Sequential reading of files for threads
@@ -151,12 +152,20 @@ struct FFTWHandler {
     }
 };
 
+// Hold extracted time information per file
+struct FileTimeInfo {
+    tm baseTime;
+    bool timeExtracted;
+    string filename;
+};
+
 struct ThreadArgs {
     atomic<int>* nextIndex; // Counter for thread-safe file indexing
     int totalFiles; // # of audio files to process
     char (*filePaths)[512]; // Input file paths
     AudioFeatures* allFeatures; // Feature extraction results
     char (*filenames)[512]; // Names of files
+    FileTimeInfo* fileTimeInfo;
 
     // User-given arguments
     int numBits, peakVolts, timeWin, fftWin, arti, fLow, fHigh, downSample;
@@ -176,10 +185,11 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
     SF_INFO sfinfo = {};
     SNDFILE* file = sf_open(filename.c_str(), SFM_READ, &sfinfo);
 
-    if (!file) {
+    if (!file) { // File open unsuccessful
         throw runtime_error("Error opening audio file: " + string(sf_strerror(file)));
     }
 
+    // Sample range calculation
     int totalFrames = sfinfo.frames;
     int endSample;
     if (range.endSample == -1) { endSample = totalFrames; }
@@ -187,18 +197,19 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
     int startSample = max(0, range.startSample - 1);
     int numFramesToRead = endSample - startSample;
 
-    if (numFramesToRead <= 0) {
+    if (numFramesToRead <= 0) { // Range invalid
         sf_close(file);
         throw runtime_error("Invalid sample range");
     }
 
-    sf_seek(file, startSample, SEEK_SET);
+    sf_seek(file, startSample, SEEK_SET); // Adjust file position
 
     int numChannels = sfinfo.channels;
-    double* interleavedSamples = new double[numFramesToRead * numChannels];
+    double* interleavedSamples = new double[numFramesToRead * numChannels]; // Raw interleaved samples
 
     int format = sfinfo.format & SF_FORMAT_SUBMASK;
 
+    // Read / convert audio samples
     switch (format) {
     case SF_FORMAT_PCM_16: {
         short* tempBuffer = new short[numFramesToRead * numChannels];
@@ -225,15 +236,15 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
         throw runtime_error("Unsupported bit format");
     }
 
-    sf_close(file);
+    sf_close(file); // Close file
 
-    // Deinterleave samples
+    // Deinterleave samples into separate channels
     double** samples = new double* [numChannels];
-    for (int ch = 0; ch < numChannels; ++ch) {
+    for (int ch = 0; ch < numChannels; ++ch) { // Allocate memory per channel
         samples[ch] = new double[numFramesToRead];
     }
 
-    for (int i = 0; i < numFramesToRead; ++i) {
+    for (int i = 0; i < numFramesToRead; ++i) { // Populate records for each channel
         for (int ch = 0; ch < numChannels; ++ch) {
             samples[ch][i] = interleavedSamples[i * numChannels + ch];
         }
@@ -249,10 +260,10 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
 __global__ void downsampleKernel(const double* x, double* result, int length, int factor) {
     int index = blockIdx.x * blockDim.x + threadIdx.x; // Compute global index of thread
     // Determine if downsampled data is in input bounds
-    if (index * factor < length) { result[index] = x[index * factor]; }
+    if (index * factor < length) { result[index] = x[index * factor]; } // Compute output sample
 }
 
-// Reduce sampling rate by for comparison between recordings with different frequencies
+// Reduce sampling rate to lower frequency
 double* downSample(const double* x, int length, int factor, int& newLength) {
     if (factor <= 0) { throw invalid_argument("Factor must be positive"); } // Validate input
 
@@ -311,7 +322,7 @@ __global__ void applyBandpassFilter(cufftDoubleComplex* freqData, int numPoints,
 // CUDA kernel to normalize inverse FFT / compute amplitude spectrum
 __global__ void normalizeAndComputeAmplitude(const cufftDoubleComplex* timeData, double* outputTime,
             double* outputAmp, int numPoints) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // Compute thread global index
     if (i >= numPoints) { return; }
 
     double norm = 1.0 / numPoints;
@@ -326,8 +337,8 @@ BandpassFilter bandpassFilter(const double* timeSeries, int numPts, double frequ
     cufftDoubleComplex* deviceFreqData;
     cudaMalloc(&deviceFreqData, sizeof(cufftDoubleComplex) * numPts);
 
-    // Copy timeSeries to device, real part only
-    cufftDoubleComplex* hostInput = new cufftDoubleComplex[numPts];
+    // Copy real timeSeries to device
+    cufftDoubleComplex* hostInput = new cufftDoubleComplex[numPts]; // Convert to complex
     for (int i = 0; i < numPts; ++i) {
         hostInput[i].x = timeSeries[i];
         hostInput[i].y = 0.0;
@@ -368,7 +379,7 @@ BandpassFilter bandpassFilter(const double* timeSeries, int numPts, double frequ
     // Copy results to host
     double* timeSeriesFilt = new double[numPts];
     double* amplitudeSpectrum = new double[numPts];
-    // Copy magnitude spectrum and time series data to host
+    // Copy magnitude spectrum / time series data to host
     cudaMemcpy(timeSeriesFilt, deviceTimeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost);
     cudaMemcpy(amplitudeSpectrum, deviceAmplitudeOut, sizeof(double) * numPts, cudaMemcpyDeviceToHost);
 
@@ -386,13 +397,14 @@ __global__ void partialSumsKernel(const double* data, double* sumOut, double* su
     __shared__ double localSum[256];
     __shared__ double localSumSq[256];
 
-    // Thread / global index
+    // Thread global index
     int threadIndex = threadIdx.x;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
     double val; // Load current val
     if (index < pointsPerTimeWin) { val = data[index]; }
     else { val = 0.0; }
+    // Write data / squared value into shared memory
     localSum[threadIndex] = val;
     localSumSq[threadIndex] = val * val;
     __syncthreads(); // Ensure all threads have written
@@ -400,13 +412,14 @@ __global__ void partialSumsKernel(const double* data, double* sumOut, double* su
     // Reduce within block
     for (int stepSize = blockDim.x / 2; stepSize > 0; stepSize >>= 1) {
         if (threadIndex < stepSize) {
+            // Calculate sums
             localSum[threadIndex] += localSum[threadIndex + stepSize];
             localSumSq[threadIndex] += localSumSq[threadIndex + stepSize];
         }
         __syncthreads(); // Ensure all threads have written
     }
 
-    // First thread in each block writes result to global memory
+    // First thread per block writes result to global memory
     if (threadIndex == 0) {
         sumOut[blockIdx.x] = localSum[0]; // Block sum
         sumSqOut[blockIdx.x] = localSumSq[0]; // Block sum of squares
@@ -443,7 +456,6 @@ double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
     cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
     // Reduce partial results to final results
-    // thrust::device_ptr = Can be used with thrust algorithms
     thrust::device_ptr<double> sumPtr(deviceSumPartial);
     thrust::device_ptr<double> sumSqPtr(deviceSumSqPartial);
 
@@ -451,8 +463,8 @@ double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
     double totalSum = thrust::reduce(sumPtr, sumPtr + blocks, 0.0, thrust::plus<double>());
     double totalSumSq = thrust::reduce(sumSqPtr, sumSqPtr + blocks, 0.0, thrust::plus<double>());
 
-    double mean = totalSum / pointsPerTimeWin;
-    double variance = (totalSumSq / pointsPerTimeWin) - (mean * mean);
+    double mean = totalSum / pointsPerTimeWin; // Calculate mean
+    double variance = (totalSumSq / pointsPerTimeWin) - (mean * mean); // Calculate variance
 
     if (variance < 1e-12) { // Avoid divide by zero
         cudaFree(deviceData);
@@ -686,7 +698,7 @@ SoloPerGM2 fSoloPerGM2(const double* pFiltInput, int inputLength, double fs, dou
     return result;
 }
 
-// Zeroes out negative frequencies and doubles positive frequencies to create frequency signal
+// Zeroes out negative frequencies / doubles positive frequencies to create frequency signal
 __global__ void hilbertFilterKernel(cufftDoubleComplex* data, int len) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= len) { return; }
@@ -740,7 +752,6 @@ fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
     cudaMemcpy(deviceIinput, input, sizeof(double) * inputLen, cudaMemcpyHostToDevice); // Copy input to device
 
     // Convert to complex
-    // Specify dimensions
     dim3 block(256);
     dim3 grid((inputLen + block.x - 1) / block.x); // All data points covered by threads
     initializeComplex <<<grid, block >>> (deviceIinput, deviceData, inputLen);
@@ -777,7 +788,7 @@ fftw_complex* hilbertRawGPU(const double* input, int inputLen) {
     return result;
 }
 
-// Perform per-window envelope comparisons with hilbert transofrms and FFTs to calculate dissimilarity
+// Perform per-window envelope comparisons with hilbert transofrms / FFTs to calculate dissimilarity
 double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTimeWin,
             double fftWin, double fs, int& outLen) {
 
@@ -901,6 +912,7 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
             sum1 += envelope1Host[j];
             sum2 += envelope2Host[j];
         }
+        // Amplitude between records
         if (sum1 > 1e-12) {
             for (int j = 0; j < ptsPerTimewin; ++j) { envelope1Host[j] /= sum1; }
         }
@@ -962,6 +974,7 @@ double* fSoloDissimGM1GPU(double** timechunkMatrix, int ptsPerTimewin, int numTi
             totalB += fftBHost[j];
         }
 
+        // Populate fft hosts
         if (totalA > 1e-12) {
             for (int j = 0; j < ptsPerFFT; ++j) { fftAHost[j] /= totalA; }
         }
@@ -1046,6 +1059,7 @@ __global__ void convertToPressureKernel(const double* samples, double* pressure,
 void gpuConvertToPressure(const double* hostSamples, double* hostPressure, int length,
             int numBits, double peakVolts, double refSens) {
 
+    // Allocate device memory
     double* deviceSamples;
     double* devicePressure;
     cudaMalloc(&deviceSamples, sizeof(double) * length);
@@ -1072,7 +1086,7 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     int fhigh, int downsampleFactor, bool omitPartialMinute) {
 
     string fixedFilePath = fixFilePath(filePath.string()); // Make file path Windows compatible
-    AudioData audio = audioRead(filePath.string()); // Read all samples and metadata
+    AudioData audio = audioRead(filePath.string()); // Read all samples / metadata
 
     int sampFreq = audio.sampleRate; // Sampling frequency
     int audioSamplesLen = audio.numFrames; // # of audio frames
@@ -1145,9 +1159,7 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
         timechunkMatrix[i] = &paddedSignal[i * ptsPerTimeWin];
         // Duration per segment
         if (i == numTimeWin - 1 && remainder > 0)
-        {
-            features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq));
-        }
+        { features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq)); }
         else { features.segmentDuration[i] = timewin; }
     }
 
@@ -1202,19 +1214,34 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
 tm extractBaseTime(const string& filename) {
     tm baseTime = {}; // Fields initialized to zero
     smatch match; // Will store matched part
-    regex pattern(R"((\d{8})_(\d{6}))"); // Matches YYYYMMDD_HHMMSS
+    regex pattern1(R"((\d{8})_(\d{6}))"); // Matches YYYYMMDD_HHMMSS
+    regex pattern2(R"(.*\.(\d{6})(\d{6}))"); // Matches XXXX.YYMMDDHHMMSS
 
     // Find date / time from file name
-    if (regex_search(filename, match, pattern) && match.size() == 3) { // Date / time / full match
+    if (regex_search(filename, match, pattern1) && match.size() == 3) {
         string date = match[1]; // Date
         string time = match[2]; // Time
 
-        baseTime.tm_year = stoi(date.substr(0, 4)) - 1900; // Years since 1900
+        baseTime.tm_year = stoi(date.substr(0, 4)) - 1900; // Years since 1900: 4 digits
         baseTime.tm_mon = stoi(date.substr(4, 2)) - 1; // Zero based month
         baseTime.tm_mday = stoi(date.substr(6, 2)); // Day of month
         baseTime.tm_hour = stoi(time.substr(0, 2)) - 1; // Hour
         baseTime.tm_min = stoi(time.substr(2, 2)); // Minute
         baseTime.tm_sec = stoi(time.substr(4, 2)); // Second
+    }
+    else if (regex_search(filename, match, pattern2) && match.size() == 3) {
+        string date = match[1]; // YYMMDD
+        string time = match[2]; // HHMMSS
+
+        int year = stoi(date.substr(0, 2)); // 2 digits
+        // Assume years 00-40 are 2000s, 41-99 are 1900s
+        if (year <= 40) { baseTime.tm_year = year + 100; } // 2000-2040
+        else { baseTime.tm_year = year; } // 1941-1999
+        baseTime.tm_mon = stoi(date.substr(2, 2)) - 1;
+        baseTime.tm_mday = stoi(date.substr(4, 2));
+        baseTime.tm_hour = stoi(time.substr(0, 2)) - 1;
+        baseTime.tm_min = stoi(time.substr(2, 2));
+        baseTime.tm_sec = stoi(time.substr(4, 2));
     }
 
     return baseTime;
@@ -1360,14 +1387,14 @@ void bubbleSort(char arr[][512], int n) {
 }
 
 void threadWrapper(ThreadArgs& args) {
-    // CRITICAL: Set CUDA device for this thread FIRST, before any CUDA operations
+    // Set CUDA device for this thread first
     cudaError_t err = cudaSetDevice(0);
     if (err != cudaSuccess) {
         cerr << "Failed to set CUDA device in thread: " << cudaGetErrorString(err) << "\n";
         return;
     }
 
-    // Verify the device is properly set
+    // Verify device is properly set
     int currentDevice;
     err = cudaGetDevice(&currentDevice);
     if (err != cudaSuccess || currentDevice != 0) {
@@ -1386,6 +1413,19 @@ void threadWrapper(ThreadArgs& args) {
 
             fs::path filePath(args.filePaths[index]);
 
+            // Extract base time from filename
+            string filename_str = filePath.filename().string();
+            tm extractedTime = extractBaseTime(filename_str);
+
+            // Store the extracted time information
+            args.fileTimeInfo[index].baseTime = extractedTime;
+            args.fileTimeInfo[index].filename = filename_str;
+
+            // Check if time was successfully extracted
+            bool timeValid = (extractedTime.tm_year > 0 || extractedTime.tm_mon >= 0 ||
+                extractedTime.tm_mday > 0 || extractedTime.tm_hour >= 0);
+            args.fileTimeInfo[index].timeExtracted = timeValid;
+
             // Perform feature extraction for current input file
             AudioFeatures features = featureExtraction(args.numBits, args.peakVolts,
                 filePath, args.RS, args.timeWin, args.avTime, args.fftWin,
@@ -1394,20 +1434,15 @@ void threadWrapper(ThreadArgs& args) {
             args.allFeatures[index] = features;
 
             // Display base filename in output results
-            string filename_str = filePath.filename().string();
             strncpy(args.filenames[index], filename_str.c_str(), 511);
             args.filenames[index][511] = '\0'; // Null terminate for safe handling
         }
     }
     // Display any errors
-    catch (const exception& e) {
-        cerr << "Exception in thread: " << e.what() << "\n";
-    }
-    catch (...) {
-        cerr << "Unknown exception in thread\n";
-    }
+    catch (const exception& e) { cerr << "Exception in thread: " << e.what() << "\n"; }
+    catch (...) { cerr << "Unknown exception in thread\n"; }
 
-    // Optional: Reset device at thread exit (good practice)
+    // Reset device at thread exit
     cudaDeviceReset();
 }
 
@@ -1428,13 +1463,12 @@ int main(int argc, char* argv[]) {
     int deviceID = 0;
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, deviceID);
-    printf("Using device %d: %s\n", deviceID, prop.name);
     cudaSetDevice(deviceID);
 
     // Default arguments if unspecified
     char inputDir[512] = {}, outputFile[512] = {};
     int numBits = 16, peakVolts = 2, arti = 1, timeWin = 60, fftWin = 1,
-            fLow = 1, fHigh = 192000, maxThreads = 4, downSample = -1;
+        fLow = 1, fHigh = 192000, maxThreads = 4, downSample = -1;
     double RS = -178.3, avTime = 0.1;
     bool omitPartialMinute = false;
 
@@ -1471,6 +1505,7 @@ int main(int argc, char* argv[]) {
     char (*filePaths)[512] = new char[totalFiles][512]; // Path to files
     char (*filenames)[512] = new char[totalFiles][512]; // Base filenames
     AudioFeatures* allFeatures = new AudioFeatures[totalFiles];
+    FileTimeInfo* fileTimeInfo = new FileTimeInfo[totalFiles]; // Time info for each file
 
     // Fill filePaths with file names
     int index = 0;
@@ -1483,7 +1518,7 @@ int main(int argc, char* argv[]) {
     }
 
     bubbleSort(filePaths, totalFiles); // Sort file paths alphabetically for in-order data processing
-    
+
     // Thread setup
     atomic<int> nextIndex(0);
     int availableThreads = max(1, thread::hardware_concurrency());
@@ -1496,6 +1531,7 @@ int main(int argc, char* argv[]) {
     args.filePaths = filePaths;
     args.filenames = filenames;
     args.allFeatures = allFeatures;
+    args.fileTimeInfo = fileTimeInfo;
     args.numBits = numBits;
     args.peakVolts = peakVolts;
     args.RS = RS;
@@ -1517,15 +1553,17 @@ int main(int argc, char* argv[]) {
     const char** fileNames = new const char* [totalFiles];
     for (int i = 0; i < totalFiles; ++i) { fileNames[i] = filenames[i]; } // Convert to const char* array
 
+    // You may want to modify saveFeaturesToCSV to also include time information
     saveFeaturesToCSV(outputFile, fileNames, totalFiles, allFeatures);
     cout << "Saved features for " << totalFiles << " files to " << outputFile << "\n";
 
-    for (int i = 0; i < totalFiles; ++i) { freeAudioFeatures(allFeatures[i]); } // Free featurees for each file
+    for (int i = 0; i < totalFiles; ++i) { freeAudioFeatures(allFeatures[i]); } // Free features for each file
 
     // Cleanup
     delete[] filePaths;
     delete[] filenames;
     delete[] allFeatures;
+    delete[] fileTimeInfo;
     delete[] fileNames;
     fftw_cleanup(); // Clean up internal memory
 
