@@ -162,9 +162,9 @@ struct FileTimeInfo {
 struct ThreadArgs { // Worker threads for parallel processing
     atomic<int>* nextIndex; // Counter for thread-safe file indexing
     int totalFiles; // # of audio files to process
-    char (*filePaths)[512]; // Input file paths
+    char (*filePaths)[128]; // Input file paths
     AudioFeatures* allFeatures; // Feature extraction results
-    char (*filenames)[512]; // Names of files
+    char (*filenames)[128]; // Names of files
     FileTimeInfo* fileTimeInfo;
 
     // User-given arguments
@@ -185,9 +185,7 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
     SF_INFO sfinfo = {}; // Audio metadata (# of channels, sample rate, etc.)
     SNDFILE* file = sf_open(filename.c_str(), SFM_READ, &sfinfo); // Open file for reading
 
-    if (!file) { // File open unsuccessful
-        throw runtime_error("Error opening audio file: " + string(sf_strerror(file)));
-    }
+    if (!file) { throw runtime_error("Error opening audio file: " + string(sf_strerror(file))); } // File open unsuccessful
 
     // Sample range calculation to fit within file bounds
     int totalFrames = sfinfo.frames;
@@ -306,10 +304,9 @@ __global__ void applyBandpassFilter(cufftDoubleComplex* freqData, int numPoints,
     int i = blockIdx.x * blockDim.x + threadIdx.x; // Thread indexing and bounds checking
     if (i >= numPoints) { return; }
 
-    int shiftedIndex = (i + numPoints / 2) % numPoints;
+    int shiftedIndex = (i + numPoints / 2) % numPoints; // Calculate index
 
-    // Convert index to frequency (Hz): Accounts for zero index centering
-    double freq = (shiftedIndex - numPoints / 2) * freqStep;
+    double freq = (shiftedIndex - numPoints / 2) * freqStep; // Convert index to frequency with index centering
     double absFreq = fabs(freq);
 
     // Zero out components outside specified range
@@ -435,6 +432,26 @@ __global__ void fourthMomentKernel(const double* data, double* fourthOut, double
     fourthOut[i] = centered * centered * centered * centered;
 }
 
+__global__ void reduceSumKernel(const double* input, double* output, int n) {
+    extern __shared__ double sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load shared memory with either data or 0
+    if (i < n) { sdata[tid] = input[i]; }
+    else { sdata[tid] = 0.0; }
+    __syncthreads();
+
+    // Reduce in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { sdata[tid] += sdata[tid + s]; }
+        __syncthreads();
+    }
+
+    // Write block result to global memory
+    if (tid == 0) {  output[blockIdx.x] = sdata[0]; }
+}
+
 // Calculate kurtosis used for impulsivity of a signal
 double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
     if (pointsPerTimeWin <= 0 || hostData == nullptr) { throw invalid_argument("Input array is empty or null"); }
@@ -456,12 +473,30 @@ double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
     cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
     // Reduce partial results to final results
-    thrust::device_ptr<double> sumPtr(deviceSumPartial);
-    thrust::device_ptr<double> sumSqPtr(deviceSumSqPartial);
+    double* sumReduceBuf = deviceSumPartial;
+    int sumN = blocks;
+    while (sumN > 1) {
+        int sumBlocks = (sumN + threads - 1) / threads;
+        reduceSumKernel << <sumBlocks, threads, threads * sizeof(double) >> > (sumReduceBuf, sumReduceBuf, sumN);
+        cudaDeviceSynchronize();
+        sumN = sumBlocks;
+    }
 
     // Sum values in parallel
-    double totalSum = thrust::reduce(sumPtr, sumPtr + blocks, 0.0, thrust::plus<double>());
-    double totalSumSq = thrust::reduce(sumSqPtr, sumSqPtr + blocks, 0.0, thrust::plus<double>());
+    double totalSum;
+    cudaMemcpy(&totalSum, sumReduceBuf, sizeof(double), cudaMemcpyDeviceToHost);
+
+    double* sumSqReduceBuf = deviceSumSqPartial;
+    int sumSqN = blocks;
+    while (sumSqN > 1) {
+        int sumBlocks = (sumSqN + threads - 1) / threads;
+        reduceSumKernel << <sumBlocks, threads, threads * sizeof(double) >> > (sumSqReduceBuf, sumSqReduceBuf, sumSqN);
+        cudaDeviceSynchronize();
+        sumSqN = sumBlocks;
+    }
+
+    double totalSumSq;
+    cudaMemcpy(&totalSumSq, sumSqReduceBuf, sizeof(double), cudaMemcpyDeviceToHost);
 
     double mean = totalSum / pointsPerTimeWin; // Calculate mean
     double variance = (totalSumSq / pointsPerTimeWin) - (mean * mean); // Calculate variance
@@ -479,9 +514,18 @@ double calculateKurtosis(const double* hostData, int pointsPerTimeWin) {
     cudaDeviceSynchronize(); // Ensure previous operations are completed before execution
 
     // Reduce fourth moment array to scalar value / sum values in parallel
-    thrust::device_ptr<double> fourthPtr(deviceFourth);
-    double fourthMoment = thrust::reduce(fourthPtr, fourthPtr + pointsPerTimeWin, 0.0,
-            thrust::plus<double>()) / pointsPerTimeWin;
+    double* fourthReduceBuf = deviceFourth;
+    int fourthN = pointsPerTimeWin;
+    while (fourthN > 1) {
+        int sumBlocks = (fourthN + threads - 1) / threads;
+        reduceSumKernel << <sumBlocks, threads, threads * sizeof(double) >> > (fourthReduceBuf, fourthReduceBuf, fourthN);
+        cudaDeviceSynchronize();
+        fourthN = sumBlocks;
+    }
+
+    double fourthMoment;
+    cudaMemcpy(&fourthMoment, fourthReduceBuf, sizeof(double), cudaMemcpyDeviceToHost);
+    fourthMoment /= pointsPerTimeWin;
 
     // Cleanup
     cudaFree(deviceData);
@@ -510,7 +554,7 @@ __global__ void correlationKernel(const double* real, const double* imaginary, i
     double sumReal = 0.0, sumImagninary = 0.0, sumRealSquare = 0.0, sumImaginarySquare = 0.0, sumRealImaginaryProd = 0.0;
     int sampleCount = 0;
     
-    // Loop through overlaping samples of current lag
+    // Loop through overlapping samples of current lag
     for (int i = 0; i < seriesLength - (lag + offset); i++) {
         double realVal = real[i];
         double imaginaryVal = imaginary[i + lag + offset];
@@ -902,6 +946,7 @@ double* calculateDissimGPU(double** timechunkMatrix, int ptsPerTimewin, int numT
         cudaMemcpy(envelope1Host, deviceEnvelope1, sizeof(double) * ptsPerTimewin, cudaMemcpyDeviceToHost);
         cudaMemcpy(envelope2Host, deviceEnvelope2, sizeof(double) * ptsPerTimewin, cudaMemcpyDeviceToHost);
 
+        // Free device memory
         cudaFree(deviceHil1);
         cudaFree(deviceHil2);
 
@@ -1000,6 +1045,7 @@ double* calculateDissimGPU(double** timechunkMatrix, int ptsPerTimewin, int numT
     delete[] fftAHost;
     delete[] fftBHost;
 
+    // Free device memory
     cudaFree(deviceFFTInput);
     cudaFree(deviceFFTOutput);
     cudaFree(deviceMagnitude);
@@ -1138,7 +1184,7 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     int ptsPerTimeWin = timewin * sampFreq;
     int numTimeWin = filt.length / ptsPerTimeWin;
     int remainder = filt.length % ptsPerTimeWin;
-    if (remainder > 0) { ++numTimeWin; } // Padded segment for leftover samples
+    if (remainder > 0) { ++numTimeWin; } // Partial minute
 
     // Pad filtered signal to match time window
     int paddedLen = numTimeWin * ptsPerTimeWin;
@@ -1310,7 +1356,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
         for (int i = 0; i < maxLength; ++i) {
             // Calculate timestamp per minute
             time_t currentEpoch = baseEpoch + i * 60; // Use correct indexing for minutes
-            tm* currentTime = localtime(&currentEpoch);
+            tm* currentTime = localtime(&currentEpoch); // Convert from Unix time to time structure
 
             outputFile << filenames[fileIdx] << ","; // Write filename
 
@@ -1373,11 +1419,12 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
 }
 
 // Sort input files
-void bubbleSort(char arr[][512], int n) {
-    char temp[512]; // Buffer for swapping strings
+void bubbleSort(char arr[][128], int n) {
+    char temp[128]; // Buffer for swapping strings
     for (int i = 0; i < n - 1; ++i) { // Iterate through array
         for (int j = 0; j < n - i - 1; ++j) { // Compare adjacent elements up to unsorted portion
             if (strcmp(arr[j], arr[j + 1]) > 0) { // Lexicographically compare two strings
+                // Swap strings using temp buffer
                 strcpy(temp, arr[j]);
                 strcpy(arr[j], arr[j + 1]);
                 strcpy(arr[j + 1], temp);
@@ -1387,22 +1434,7 @@ void bubbleSort(char arr[][512], int n) {
 }
 
 void threadWrapper(ThreadArgs& args) {
-    // Set CUDA device for this thread first
-    cudaError_t err = cudaSetDevice(0);
-    if (err != cudaSuccess) { // Error accessing GPU
-        cerr << "Failed to set CUDA device in thread: " << cudaGetErrorString(err) << "\n";
-        return;
-    }
-
-    // Verify device is properly set
-    int currentDevice;
-    err = cudaGetDevice(&currentDevice);
-    if (err != cudaSuccess || currentDevice != 0) {
-        cerr << "CUDA device not properly set in thread. Current device: " << currentDevice << "\n";
-        return;
-    }
-
-    try {
+    try { // Use parallel processing to extract features from multiple files at a time
         while (true) { // Find next index
             int index = args.nextIndex->fetch_add(1);
             if (index >= args.totalFiles) { break; } // End of input files
@@ -1434,16 +1466,13 @@ void threadWrapper(ThreadArgs& args) {
             args.allFeatures[index] = features;
 
             // Display base filename in output results
-            strncpy(args.filenames[index], filename_str.c_str(), 511);
+            strcpy(args.filenames[index], filename_str.c_str()); // Copy 
             args.filenames[index][511] = '\0'; // Null terminate for safe handling
         }
     }
     // Display any errors
     catch (const exception& e) { cerr << "Exception in thread: " << e.what() << "\n"; }
     catch (...) { cerr << "Unknown exception in thread\n"; }
-
-    // Reset device at thread exit
-    cudaDeviceReset();
 }
 
 // Process directory of sound files with user-given parameters
@@ -1475,8 +1504,8 @@ int main(int argc, char* argv[]) {
     // Command line index parsing
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--omit_partial_minute") == 0) { omitPartialMinute = true; }
-        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) { strncpy(inputDir, argv[++i], sizeof(inputDir) - 1); }
-        else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) { strncpy(outputFile, argv[++i], sizeof(outputFile) - 1); }
+        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) { strcpy(inputDir, argv[++i]); }
+        else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) { strcpy(outputFile, argv[++i]); }
         else if (strcmp(argv[i], "--num_bits") == 0) { numBits = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--RS") == 0) { RS = atof(argv[++i]); }
         else if (strcmp(argv[i], "--peak_volts") == 0) { peakVolts = atoi(argv[++i]); }
@@ -1501,9 +1530,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Allocate arrays with kebgtg of # of files
-    char (*filePaths)[512] = new char[totalFiles][512]; // Path to files
-    char (*filenames)[512] = new char[totalFiles][512]; // Base filenames
+    // Allocate arrays large enough for all files
+    char (*filePaths)[128] = new char[totalFiles][128]; // Path to files
+    char (*filenames)[128] = new char[totalFiles][128]; // Base filenames
     AudioFeatures* allFeatures = new AudioFeatures[totalFiles]; // Initialize AudioFeatures struct
     FileTimeInfo* fileTimeInfo = new FileTimeInfo[totalFiles]; // Time info for each file
 
@@ -1511,7 +1540,7 @@ int main(int argc, char* argv[]) {
     int index = 0;
     for (const auto& entry : fs::directory_iterator(inputDir)) {
         if (entry.path().extension() == ".wav") {
-            strncpy(filePaths[index], entry.path().string().c_str(), 511);
+            strcpy(filePaths[index], entry.path().string().c_str());
             filePaths[index][511] = '\0'; // Reserve final index for terminal character
             ++index;
         }
@@ -1547,7 +1576,7 @@ int main(int argc, char* argv[]) {
     // Launch threads
     thread* threads = new thread[numThreads];
     for (int i = 0; i < numThreads; ++i) { threads[i] = thread(threadWrapper, ref(args)); }
-    for (int i = 0; i < numThreads; ++i) { threads[i].join(); }
+    for (int i = 0; i < numThreads; ++i) { threads[i].join(); } // Synchronize threads
     delete[] threads;
 
     const char** fileNames = new const char* [totalFiles];
