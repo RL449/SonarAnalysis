@@ -170,7 +170,7 @@ struct ThreadArgs { // Worker threads for parallel processing
     // User-given arguments
     int numBits, peakVolts, timeWin, fftWin, fLow, fHigh, downSample;
     double RS, avTime, artiLen;
-    bool omitPartialMinute;
+    bool omitPartialMinute, debugOutput;
 };
 
 static mutex fftw_plan_mutex; // Thread safe global mutex for FFTW plan creation
@@ -1056,8 +1056,8 @@ void freeAudioFeatures(AudioFeatures& features) {
 
 // Main feature extraction
 AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& filePath,
-    double refSens, int timewin, double avtime, int fftWin, int calToneLen, int flow,
-    int fhigh, int downsampleFactor, bool omitPartialMinute) {
+            double refSens, int timewin, double avtime, int fftWin, int calToneLen, int flow,
+            int fhigh, int downsampleFactor, bool omitPartialMinute) {
 
     string fixedFilePath = fixFilePath(filePath.string()); // Make file path Windows compatible
     AudioData audio = audioRead(filePath.string()); // Read all samples / metadata
@@ -1413,6 +1413,12 @@ void threadWrapper(ThreadArgs& args) {
         if (index >= args.totalFiles) { break; } // No more files
 
         try {
+            if (args.debugOutput == 1) {
+                // Inform user of file processing progress
+                cout << "Processing file index " << index << ": " << args.filePaths[index] << "\n";
+                cerr.flush();
+            }
+            
             fs::path filePath(args.filePaths[index]); // Convert C-style path to a filesystem::path for safe handling
             string filenameStr = filePath.filename().string(); // Extract filename without path
 
@@ -1452,7 +1458,7 @@ int main(int argc, char* argv[]) {
     int num_bits = 16, peak_volts = 2;
     int timewin = 60, fft_win = 1, flow = 1, fhigh = 16000;
     double RS = -178.3, avtime = 0.1, artiLen = 0.0;
-    int max_threads = 1, downsample = -1;
+    int max_threads = 1, downsample = -1, debug_output = 0;
     bool omit_partial_minute = false;
 
     // Parse command line arguments
@@ -1471,6 +1477,8 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--fhigh") == 0 && i + 1 < argc) { fhigh = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--max_threads") == 0 && i + 1 < argc) { max_threads = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--downsample") == 0 && i + 1 < argc) { downsample = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--debug_output") == 0 && i + 1 < argc) { debug_output = atoi(argv[++i]); }
+        
     }
 
     // Collect file paths
@@ -1526,6 +1534,7 @@ int main(int argc, char* argv[]) {
     args.fHigh = fhigh;
     args.downSample = downsample;
     args.omitPartialMinute = omit_partial_minute;
+    args.debugOutput = debug_output;
 
     // Launch threads
     thread* threads = new thread[numThreads];
@@ -1557,7 +1566,13 @@ int main(int argc, char* argv[]) {
     // Write output
     vector<double> crossFileDissimVector; // Empty vector since we're handling it differently now
     saveFeaturesToCSV(output_file, file_names, totalFiles, allFeatures, crossFileDissimVector);
-    
+
+    if (debug_output == 1) {
+        // Inform user of file processing progress
+        cout << "Saved features for " << totalFiles << " files to " << output_file << endl;
+        cerr.flush();
+    }
+
     for (int i = 0; i < totalFiles; ++i) { freeAudioFeatures(allFeatures[i]); } // Deallocate memory
     fftw_cleanup(); // Clean up FFTW resources
 
