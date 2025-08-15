@@ -61,6 +61,8 @@ Optional parameters:
 
 - Omission of incomplete minutes
 
+- Inclusion of processing output
+
 File names in the input directory are assumed to be on contain a timestamp with the format "YYYYMMDD_HHMMSS".
 File names without this format will generate "NaN" date/time columns.
 
@@ -80,10 +82,10 @@ Ex:
 nvcc -std=c++17 --extended-lambda -Xcompiler "/MT" -DCCCL_IGNORE_DEPRECATED_CPP_DIALECT -o main_original.exe main_original.cu -I"C:\Users\rlessard\Desktop\vcpkg\installed\x64-windows\include" -L"C:\Users\rlessard\Desktop\vcpkg\installed\x64-windows\lib" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\include" -L"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\lib\x64" -lsndfile -lfftw3 -lcufft -lcudart --Wno-deprecated-gpu-targets -Xlinker /SUBSYSTEM:CONSOLE
 
 Run program:
-main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\output\directory\output_filename.csv" --num_bits # --RS -# --peak_volts # --arti_len # --timewin # --fft_win # --avtime # --flow # --fhigh # --max_threads # --downsample # --omit_partial_minute
+main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\output\directory\output_filename.csv" --num_bits # --RS -# --peak_volts # --arti_len # --timewin # --fft_win # --avtime # --flow # --fhigh # --max_threads # --downsample # --omit_partial_minute --debug_output 1
 
 Ex:
-main_original.exe --input "C:\Users\rlessard\Desktop\ValDrixAudio" --output "C:\Users\rlessard\Desktop\runThisOutput\cpp_output_ValDrixAudio.csv" --num_bits 24 --RS -178.3 --peak_volts 2 --arti_len 0 --timewin 60 --fft_win 1 --avtime 0.1 --flow 1 --fhigh 128000 --max_threads 1 --downsample 2 --omit_partial_minute
+main_original.exe --input "C:\Users\rlessard\Desktop\ValDrixAudio" --output "C:\Users\rlessard\Desktop\runThisOutput\cpp_output_ValDrixAudio.csv" --num_bits 24 --RS -178.3 --peak_volts 2 --arti_len 0 --timewin 60 --fft_win 1 --avtime 0.1 --flow 1 --fhigh 128000 --max_threads 1 --downsample 2 --omit_partial_minute --debug_output 1
 
 Notes:
 
