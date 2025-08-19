@@ -77,6 +77,7 @@ Ensure these libraries are available and properly linked:
 
 CPP:
 
+
 Compilation:
 g++ -o main_original.exe main_original.cpp -IC:\Users\rlessard\Desktop\vcpkg\installed\x64-windows\include -LC:\path\to\vcpkg\installed\x64-windows\lib -lsndfile -lfftw3
 
