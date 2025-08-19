@@ -45,6 +45,11 @@ struct BandpassFilter {
     int num_pts; // # of samples
 
     BandpassFilter(double* ts, double* amp, int n) : time_series_filt(ts), amp_spectrum(amp), num_pts(n) {}
+
+    ~BandpassFilter() {
+        delete[] time_series_filt;
+        delete[] amp_spectrum;
+    }
 };
 
 struct Correlation {
@@ -1488,7 +1493,7 @@ int main(int argc, char* argv[]) {
     for (const auto& entry : fs::directory_iterator(input_dir)) {
         if (entry.path().extension() == ".wav") {
             strcpy(filePaths[index], entry.path().string().c_str());
-            filePaths[index][511] = '\0'; // Reserve final index for terminal character
+            filePaths[index][127] = '\0'; // Reserve final index for terminal character
             ++index;
         }
     }
