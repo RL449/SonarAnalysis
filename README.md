@@ -74,7 +74,9 @@ Ensure these libraries are available and properly linked:
 
 - cudart
 
+
 CPP:
+
 Compilation:
 g++ -o main_original.exe main_original.cpp -IC:\Users\rlessard\Desktop\vcpkg\installed\x64-windows\include -LC:\path\to\vcpkg\installed\x64-windows\lib -lsndfile -lfftw3
 
@@ -86,6 +88,7 @@ main_original.exe --input "C:\path\to\input\directory" --output "C:\path\to\outp
 
 Program Execution Example:
 main_original.exe --input "C:\Users\rlessard\Desktop\ValDrixAudio" --output "C:\Users\rlessard\Desktop\runThisOutput\cpp_output_ValDrixAudio.csv" --num_bits 24 --RS -178.3 --peak_volts 2 --arti_len 0.0 --timewin 60 --fft_win 1 --avtime 0.1 --flow 1 --fhigh 128000 --max_threads 5 --downsample 2 --omit_partial_minute --debug_output 1
+
 
 CUDA
 
