@@ -428,14 +428,15 @@ double calculate_kurtosis(const double* data, int length) {
     // Calculate fourth moment
     double sumFourth = 0.0;
     for (int i = 0; i < length; i++) {
-        double centeredSquare = (data[i] - mean) * (data[i] - mean);
-        sumFourth += centeredSquare * centeredSquare;
+        double diff = data[i] - mean;
+        sumFourth += diff * diff * diff * diff;
     }
     
     double variance = (sumSquared / length) - (mean * mean); // Calculate variance
     if (variance < 1e-12) { return 0.0; } // Avoid division by zero
     
-    return (sumFourth / length) / (variance * variance); // Fourth moment / squared variance
+    double fourthMoment = sumFourth / length;
+    return fourthMoment / (variance * variance); // Fourth moment / squared variance
 }
 
 // Calculate autocorrelation between two signals
@@ -757,24 +758,29 @@ fftw_complex* hilbertRaw(const double* input, int inputLen) {
 double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTimeWin,
             double fftWin, double fs, int& outLen) {
     int pts_per_fft = static_cast<int>(fftWin * fs); // # of samples per FFT
-    if (pts_per_fft <= 0 || ptsPerTimewin <= 0 || numTimeWin <= 1) { return nullptr; } // Validate input
+    if (pts_per_fft <= 0 || ptsPerTimewin <= 0 || numTimeWin <= 1) { // Validate input
+        outLen = 0;
+        return nullptr;
+    }
     
     int numfftwin = (ptsPerTimewin - pts_per_fft) / pts_per_fft + 1; // # of FFT windows per segment
-    if (numfftwin <= 0) { return nullptr; }
+    if (numfftwin <= 0) {
+        outLen = 0;
+        return nullptr;
+    }
 
     outLen = numTimeWin; // # of dissimilarity records for output
 
     // Use local FFTW resources instead of cached ones for thread safety
-    double* envelope = new double[ptsPerTimewin]; // Normalized amplitude of previous window
-    double* env2 = new double[ptsPerTimewin]; // Normalized amplitude of current window
+    double* envelope1 = new double[ptsPerTimewin]; // Normalized amplitude of previous window
+    double* envelope2 = new double[ptsPerTimewin]; // Normalized amplitude of current window
     double* fftA = new double[pts_per_fft]; // FFT magnitude of previous window
     double* fftB = new double[pts_per_fft]; // FFT magnitude of current window
-
     double* diss = new double[outLen]; // Dissimilarity results
 
     // Create batch FFT resources with thread safe plan creation
     double* batch_in = (double*)fftw_malloc(sizeof(double) * pts_per_fft * numfftwin);
-    fftw_complex* batch_out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * pts_per_fft * numfftwin);
+    fftw_complex* batch_out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * ((pts_per_fft / 2 + 1) * numfftwin));
 
     fftw_plan batch_plan; // Thread safe FFTW batch plan for all FFT windows
     {
@@ -784,11 +790,11 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
             &pts_per_fft, // array of fft sizes
             numfftwin, // # of FFT windows per batch
             batch_in, // input array
-            NULL, // input strides (default)
+            nullptr, // input strides (default)
             1, // input distance between batches
             pts_per_fft, // input stride (elements between input points)
             batch_out, // output array
-            NULL, // output strides (default)
+            nullptr, // output strides (default)
             1, // output distance between batches
             (pts_per_fft / 2) + 1, // output stride (complex output length)
             FFTW_ESTIMATE); // Plan flag
@@ -797,52 +803,48 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
     if (!batch_plan) { // Plan creation unsuccessful
         fftw_free(batch_in);
         fftw_free(batch_out);
-        delete[] envelope;
-        delete[] env2;
+        delete[] envelope1;
+        delete[] envelope2;
         delete[] fftA;
         delete[] fftB;
         delete[] diss;
+        outLen = 0;
         return nullptr;
     }
 
     // Calculate normalized magnitude spectrum with batched FFT
     auto calc_fft_mag_batched = [&](const double* input, double* output) {
-        
-        // Single declarations outisde loops
-        int i, j, base, half_bins;
-        double mag_sum, total;
-
-        fill(output, output + pts_per_fft, 0.0);// Clear output
+        fill(output, output + pts_per_fft, 0.0); // Clear output
 
         // Write all FFT windows into batch input
-        for (i = 0; i < numfftwin; ++i) {
-            base = i * pts_per_fft;
-            memcpy(batch_in + i * pts_per_fft, input + base, sizeof(double) * pts_per_fft);
+        for (int i = 0; i < numfftwin; ++i) {
+            memcpy(batch_in + i * pts_per_fft, input + i * pts_per_fft, sizeof(double) * pts_per_fft);
         }
 
         fftw_execute(batch_plan); // Execute batch FFT
 
-        half_bins = pts_per_fft / 2 + 1; // Positive frequencies
+        int half_bins = pts_per_fft / 2 + 1; // Positive frequencies
 
         // Sum magnitudes across all FFT windows
-        for (j = 0; j < half_bins; ++j) {
-            mag_sum = 0.0;
-            for (i = 0; i < numfftwin; ++i) {
+        for (int j = 0; j < half_bins; ++j) {
+            double mag_sum = 0.0;
+            for (int i = 0; i < numfftwin; ++i) {
                 fftw_complex& c = batch_out[i * half_bins + j];
                 mag_sum += sqrt(c[0] * c[0] + c[1] * c[1]); // Calculate magnitude using hypotenuse
             }
             output[j] = mag_sum;
-            if (j > 0 && j < pts_per_fft / 2) { output[pts_per_fft - j] = mag_sum; } // Mirror negative frequencies
         }
 
         // Normalize magnitude spectrum
-        total = 0.0;
-        for (j = 0; j < pts_per_fft; ++j) { total += output[j]; }
+        double total = 0.0;
+        for (int j = 0; j < half_bins; ++j) total += output[j];
         if (total > 1e-12) {
-            for (j = 0; j < pts_per_fft; ++j) { output[j] /= total; }
+            for (int j = 0; j < half_bins; ++j) output[j] /= total;
         }
-        else { fill(output, output + pts_per_fft, 0.0); } // Avoid division by zero
-        };
+        else {
+            fill(output, output + half_bins, 0.0); // Avoid division by zero
+        }
+    };
 
     diss[0] = NAN;  // Set first element to NaN
 
@@ -851,7 +853,7 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
     double sum1, sum2, timeDiss, env2_norm, freqDiss;
 
     // Iterate through consecutive time windows to calculate dissimilarity between them
-    for (i = 1; i < outLen; ++i) {
+    for (int i = 1; i < outLen; ++i) {
         fftw_complex* hil1 = hilbert_raw(timechunkMatrix[i - 1], ptsPerTimewin);
         fftw_complex* hil2 = hilbert_raw(timechunkMatrix[i], ptsPerTimewin);
 
@@ -863,12 +865,12 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
         }
 
         // Calculate amplitude envelopes
-        sum1 = 0.0, sum2 = 0.0;
-        for (k = 0; k < ptsPerTimewin; ++k) {
-            envelope[k] = hypot(hil1[k][0], hil1[k][1]);
-            env2[k] = hypot(hil2[k][0], hil2[k][1]);
-            sum1 += envelope[k];
-            sum2 += env2[k];
+        double sum1 = 0.0, sum2 = 0.0;
+        for (int k = 0; k < ptsPerTimewin; ++k) {
+            envelope1[k] = hypot(hil1[k][0], hil1[k][1]);
+            envelope2[k] = hypot(hil2[k][0], hil2[k][1]);
+            sum1 += envelope1[k];
+            sum2 += envelope2[k];
         }
 
         // Deallocate resources
@@ -876,30 +878,21 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
         fftw_free(hil2);
 
         // Normalize envelopes
-        if (sum1 > 1e-12) {
-            for (k = 0; k < ptsPerTimewin; ++k) { envelope[k] /= sum1; }
-        }
-        else { fill(envelope, envelope + ptsPerTimewin, 0.0); }
+        if (sum1 > 1e-12) for (int k = 0; k < ptsPerTimewin; ++k) envelope1[k] /= sum1;
+        if (sum2 > 1e-12) for (int k = 0; k < ptsPerTimewin; ++k) envelope2[k] /= sum2;
 
         // Time domain dissimilarity
-        timeDiss = 0.0;
-        if (sum2 > 0.0) {
-            for (k = 0; k < ptsPerTimewin; ++k) {
-                env2_norm = env2[k] / sum2;
-                timeDiss += fabs(envelope[k] - env2_norm);
-            }
-        }
-        else {
-            for (k = 0; k < ptsPerTimewin; ++k) { timeDiss += envelope[k]; }
-        }
+        double timeDiss = 0.0;
+        for (int k = 0; k < ptsPerTimewin; ++k) { timeDiss += fabs(envelope1[k] - envelope2[k]); }
         timeDiss *= 0.5; // Normalize scaling
 
         // Frequency domain dissimilarity using batched FFT
         calc_fft_mag_batched(timechunkMatrix[i - 1], fftA);
         calc_fft_mag_batched(timechunkMatrix[i], fftB);
 
-        freqDiss = 0.0;
-        for (int j = 0; j < pts_per_fft; ++j) { freqDiss += fabs(fftA[j] - fftB[j]); }
+        double freqDiss = 0.0;
+        int half_bins = pts_per_fft / 2 + 1;
+        for (int j = 0; j < half_bins; ++j) { freqDiss += fabs(fftA[j] - fftB[j]); }
         freqDiss *= 0.5;
 
         diss[i] = timeDiss * freqDiss; // Combined dissimilarity: time * frequency
@@ -910,8 +903,8 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
     fftw_free(batch_in);
     fftw_free(batch_out);
 
-    delete[] envelope;
-    delete[] env2;
+    delete[] envelope1;
+    delete[] envelope2;
     delete[] fftA;
     delete[] fftB;
 
@@ -1182,17 +1175,16 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
 
         // Vectorizable inner loop
 #pragma omp simd reduction(+:sumsq) reduction(max:peak)
-        for (int j = 0; j < current_pts; ++j) {
-            double v = chunk[j];
-            double abs_v = fabs(v);
-            sumsq += v * v;
-            if (abs_v > peak) { peak = abs_v; }
+        for (int j = 0; j < pts_per_timewin; ++j) {
+            double temp = chunk[j];
+            sumsq += temp * temp;
+            if (fabs(temp) > peak) { peak = fabs(temp); }
         }
 
-        double rms = sqrt(sumsq / current_pts);
-        features.SPLrms[i] = 20.0 * log10(fmax(rms, 1e-12));
-        features.SPLpk[i] = 20.0 * log10(fmax(peak, 1e-12));
-        features.impulsivity[i] = calculate_kurtosis(chunk, current_pts);
+        double rms = sqrt(sumsq / pts_per_timewin);
+        features.SPLrms[i] = 20.0 * log10(max(rms, 1e-12));
+        features.SPLpk[i] = 20.0 * log10(max(peak, 1e-12));
+        features.impulsivity[i] = calculate_kurtosis(chunk, pts_per_timewin);
     }
 
     // Autocorrelation / Peak count
