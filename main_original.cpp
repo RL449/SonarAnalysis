@@ -95,6 +95,10 @@ struct AudioData {
     int numChannels; // # of audio channels
     int numFrames; // # of frames per channel
     int sampleRate; // Sampling rate (Hz)
+};
+
+struct AudioInfo {
+    int sampleRate; // Sampling rate (Hz)
     double duration; // Duration of audio (seconds)
 };
 
@@ -286,7 +290,7 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
     delete[] interleavedSamples; // Deallocate memory
     double duration = static_cast<double>(sfinfo.frames) / sfinfo.samplerate; // Recording length (seconds)
 
-    return AudioData{ samples, numChannels, numFramesToRead, sfinfo.samplerate, duration };
+    return AudioData{ samples, numChannels, numFramesToRead, sfinfo.samplerate };
 }
 
 // Reduce sampling rate by analyzing (1 / factor) samples
@@ -300,6 +304,24 @@ double* downsample(const double* x, int length, int factor, int& newLength) {
     for (int i = 0; i < length; i += factor) { result[idx++] = x[i]; } // Copy (1 / factor) samples
     
     return result;
+}
+
+AudioInfo audioread_info(const string& file_path) {
+    SF_INFO sfInfo = { 0 }; // Struct containing sound metadata (frames, samplerate, channels, format)
+    SNDFILE* file = sf_open(file_path.c_str(), SFM_READ, &sfInfo); // Open audio file in read mode
+
+    if (!file) { // Error opening file
+        throw runtime_error("Error opening audio file: " + file_path);
+    }
+
+    int sampleRate = sfInfo.samplerate; // Get sample rate
+    int numFrames = sfInfo.frames; // Get # of frames
+
+    float duration = static_cast<float>(numFrames) / sampleRate; // Calculate duration (seconds)
+
+    sf_close(file); // Close file after reading info
+
+    return { sampleRate, duration };
 }
 
 // Manually shift zero-frequency to center of array
@@ -1060,8 +1082,11 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
             int fhigh, int downsampleFactor, bool omitPartialMinute) {
 
     string fixedFilePath = fixFilePath(filePath.string()); // Make file path Windows compatible
-    AudioData audio = audioRead(filePath.string()); // Read all samples / metadata
+    AudioInfo info = audioread_info(fixedFilePath); // Read all samples / metadata
 
+    int total_samples = static_cast<int>(info.sampleRate * info.duration);
+    int startSample = info.sampleRate * calToneLen + 1;
+    AudioData audio = audioRead(filePath.string(), SampleRange{ startSample, total_samples });
     int sampFreq = audio.sampleRate; // Sampling frequency
     int audioSamplesLen = audio.numFrames; // # of audio frames
 
@@ -1075,16 +1100,6 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
         pressure = downsampled;
         audioSamplesLen = newLen;
         sampFreq /= downsampleFactor;
-    }
-
-    // Optionally remove excess noise at start of recording
-    if (calToneLen > 0 && audioSamplesLen > calToneLen * sampFreq) {
-        int newLen = audioSamplesLen - calToneLen * sampFreq;
-        double* shifted = new double[newLen];
-        memcpy(shifted, pressure + calToneLen * sampFreq, sizeof(double) * newLen);
-        delete[] pressure;
-        pressure = shifted;
-        audioSamplesLen = newLen;
     }
 
     // Optionally only include full minutes of recordings
