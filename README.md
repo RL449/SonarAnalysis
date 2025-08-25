@@ -31,7 +31,7 @@ The user specifies the following required parameters:
 
 - Input directory
 
-- Output directory
+- Output file name with full directory
 
 
 The following additional parameters are optional:
