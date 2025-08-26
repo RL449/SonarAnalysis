@@ -34,33 +34,33 @@ The user specifies the following required parameters:
 - Output file name with full directory
 
 
-The following additional parameters are optional:
+The following additional parameters are optional (with default settings):
 
-- Bit depth
+- Bit depth (16)
 
-- Reference sensitivity (dB)
+- Reference sensitivity in dB (-178.3)
 
-- Peak volts
+- Peak volts (2)
 
-- Duration of excess noise at start of recording (seconds)
+- Duration of excess noise at start of recording in seconds (0.0)
 
-- Time window length (seconds)
+- Time window length in seconds (60)
 
-- Fast Fourier Transform window (seconds)
+- Fast Fourier Transform window in seconds (1)
 
-- Averaging window time (seconds)
+- Averaging window time in seconds (0.1)
 
-- Low frequency cutoff (Hz)
+- Low frequency cutoff in Hz (1)
 
-- High frequency cutoff (Hz)
+- High frequency cutoff in Hz (16000)
 
-- Maximum number of threads
+- Maximum number of threads (All threads on device)
 
-- Downsampling factor
+- Downsampling factor (-1: No downsampling)
 
-- Omission of incomplete minutes
+- Omission of incomplete minutes (false)
 
-- Inclusion of processing output
+- Inclusion of processing output (no inclusion)
 
 File names in the input directory are assumed to be on contain a timestamp with the format "YYYYMMDD_HHMMSS" or "XXXX.YYMMDDHHMMSS".
 File names without this format will generate "NaN" date/time columns.
