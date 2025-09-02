@@ -33,14 +33,14 @@ The user specifies the following required parameters:
 
 - Output file name with full directory
 
+- Peak voltage
+
 
 The following additional parameters are optional (with default settings):
 
 - Bit depth (16)
 
 - Reference sensitivity in dB (-178.3)
-
-- Peak volts (2)
 
 - Duration of excess noise at start of recording in seconds (0.0)
 
