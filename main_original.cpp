@@ -129,18 +129,18 @@ struct FFTWHandler {
     fftw_plan forwardPlan = nullptr; // Forward FFT plan: Frequency to time
     fftw_plan inversePlan = nullptr; // Inverse FFT plan: Time to frequency
     int size = 0; // # of points
-    
+
     // Constructor
     FFTWHandler(int N) : size(N) {
         buf = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * N); // Allocate FFTW buffer
         if (!buf) { throw bad_alloc(); } // Allocation unsuccessful
-        
+
         forwardPlan = fftw_plan_dft_1d(size, buf, buf, FFTW_FORWARD, FFTW_ESTIMATE); // Create forward plan
         if (!forwardPlan) { // Error creating forward plan
             fftw_free(buf);
             throw runtime_error("FFTW forward plan creation failed");
         }
-        
+
         inversePlan = fftw_plan_dft_1d(size, buf, buf, FFTW_BACKWARD, FFTW_ESTIMATE); // Create inverse plan
         if (!inversePlan) { // Error creating inverse plan
             fftw_destroy_plan(forwardPlan);
@@ -148,14 +148,14 @@ struct FFTWHandler {
             throw runtime_error("FFTW inverse plan creation failed");
         }
     }
-    
+
     // Destructor
     ~FFTWHandler() {
         if (forwardPlan) { fftw_destroy_plan(forwardPlan); }
         if (inversePlan) { fftw_destroy_plan(inversePlan); }
         if (buf) { fftw_free(buf); }
     }
-    
+
     // Delete copy constructor / assignment operator to prevent copying between threads
     FFTWHandler(const FFTWHandler&) = delete;
     FFTWHandler& operator=(const FFTWHandler&) = delete;
@@ -163,8 +163,8 @@ struct FFTWHandler {
 
 // Hold extracted time information per file
 struct FileTimeInfo {
-    tm baseTime; // Struct containing date/time components
-    bool timeExtracted; // Time successfully extracted
+    chrono::system_clock::time_point baseTime; // Date/time object
+    bool timeExtracted = false; // Time successfully extracted
     string filename;
 };
 
@@ -180,6 +180,13 @@ struct ThreadArgs { // Worker threads for parallel processing
     int numBits, peakVolts, timeWin, fftWin, fLow, fHigh, downSample;
     double RS, avTime, artiLen;
     bool omitPartialMinute, debugOutput;
+};
+
+struct AudioParams {
+    int num_bits; // Bit depth
+    int peak_volts; // Full scale voltage
+    int fhigh; // High frequency cutoff
+    bool success; // Parameters successfully extracted
 };
 
 static mutex fftw_plan_mutex; // Thread safe global mutex for FFTW plan creation
@@ -237,7 +244,7 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
     SF_INFO sfinfo = {}; // Audio metadata (# of channels, sample rate, etc.)
     SNDFILE* file = sf_open(filename.c_str(), SFM_READ, &sfinfo); // Open file for reading
     // File open unsuccessful
-    if (!file) { throw runtime_error("Error opening audio file: " + string(sf_strerror(file))); } 
+    if (!file) { throw runtime_error("Error opening audio file: " + string(sf_strerror(file))); }
     // Sample range calculation to fit within file bounds
     int totalFrames = sfinfo.frames;
     int endSample;
@@ -263,17 +270,21 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
         short* tempBuffer = new short[numFramesToRead * numChannels];
         sf_readf_short(file, tempBuffer, numFramesToRead);
         for (int i = 0; i < numFramesToRead * numChannels; ++i)
-            { interleavedSamples[i] = static_cast<double>(tempBuffer[i]);}
+        {
+            interleavedSamples[i] = static_cast<double>(tempBuffer[i]);
+        }
         delete[] tempBuffer;
         break;
     }
-    // 24 or 32 bits
+                         // 24 or 32 bits
     case SF_FORMAT_PCM_24:
     case SF_FORMAT_PCM_32: {
         int* tempBuffer = new int[numFramesToRead * numChannels];
         sf_readf_int(file, tempBuffer, numFramesToRead);
         for (int i = 0; i < numFramesToRead * numChannels; ++i)
-            { interleavedSamples[i] = static_cast<double>(tempBuffer[i]); }
+        {
+            interleavedSamples[i] = static_cast<double>(tempBuffer[i]);
+        }
         delete[] tempBuffer;
         break;
     }
@@ -301,13 +312,13 @@ AudioData audioRead(const string& filename, SampleRange range = { 1, -1 }) {
 // Reduce sampling rate by analyzing (1 / factor) samples
 double* downsample(const double* x, int length, int factor, int& newLength) {
     if (factor <= 0) { throw invalid_argument("Factor must be positive"); } // Invalid scaling factor
-    
+
     newLength = (length + factor - 1) / factor; // # of output samples
     double* result = new double[newLength]; // Downsampled output
 
     int idx = 0;
     for (int i = 0; i < length; i += factor) { result[idx++] = x[i]; } // Copy (1 / factor) samples
-    
+
     return result;
 }
 
@@ -334,7 +345,7 @@ ArrayShiftFFT fftshift(double* input, int length) {
     double* shifted = new double[length]; // Shifted array
     // Shift indices from center / center zero frequency sample
     for (int i = 0; i < length; ++i) { shifted[i] = input[(i + (length / 2)) % length]; }
-    return {shifted, length};
+    return { shifted, length };
 }
 
 // Apply bandpass filter in frequency domain
@@ -374,7 +385,7 @@ BandpassFilter bandpass_filter(const double* time_series, int num_pts, double fr
     double reclen = num_pts * frequency; // Recording length (seconds)
     double freq_step = 1.0 / reclen; // Hz per bin
     double freq_offset = -num_pts * 0.5 * freq_step; // Start frequency for centered axis
-    
+
     // Frequency array before shift
     double* freq = new double[num_pts];
     for (int i = 0; i < num_pts; ++i) { freq[i] = freq_offset + i * freq_step; }
@@ -383,7 +394,7 @@ BandpassFilter bandpass_filter(const double* time_series, int num_pts, double fr
 
     // Set high-frequency cutoff
     if (fhigh == 0.0) { fhigh = 0.5 / frequency; }
-    
+
     // Apply bandpass filter directly to buffer
     for (int i = 0; i < num_pts; ++i) {
         double abs_freq = fabs(shifted_freq.data[i]);
@@ -420,26 +431,26 @@ double calculate_kurtosis(const double* data, int length) {
     if (length <= 0 || data == nullptr) { throw invalid_argument("Input array is empty or null"); }
 
     double sum = 0.0, sumSquared = 0.0;
-    
+
     // Calculate sums
     for (int i = 0; i < length; i++) {
         double val = data[i];
         sum += val;
         sumSquared += val * val;
     }
-    
+
     double mean = sum / length; // Calculate mean
-    
+
     // Calculate fourth moment
     double sumFourth = 0.0;
     for (int i = 0; i < length; i++) {
         double diff = data[i] - mean;
         sumFourth += diff * diff * diff * diff;
     }
-    
+
     double variance = (sumSquared / length) - (mean * mean); // Calculate variance
     if (variance < 1e-12) { return 0.0; } // Avoid division by zero
-    
+
     double fourthMoment = sumFourth / length;
     return fourthMoment / (variance * variance); // Fourth moment / squared variance
 }
@@ -522,7 +533,7 @@ SoloPer calculatePeriodicity(double* p_filt_input, int input_length, double fs, 
     int j, i, jj, zz; // Iterators
     double* input_start;
     double val;
-    
+
     // Squared input signal segmented into windows
     double** p_filt_reshaped = new double* [numTimeWins];
     for (i = 0; i < numTimeWins; i++) { p_filt_reshaped[i] = new double[sampWindowSize]; }
@@ -727,47 +738,15 @@ void normalizeResult(fftw_complex* data, int len) {
     }
 }
 
-// Compute Hilbert transform of real input (analytic signal)
-fftw_complex* hilbertRaw(const double* input, int inputLen) {
-    if (!input || inputLen <= 0) { // Validate input
-        cerr << "Invalid input to hilbertRaw\n";
-        return nullptr;
-    }
-
-    fftw_complex* data = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * inputLen); // Create FFT buffer
-    if (!data) { // Error creating buffer
-        cerr << "Failed to allocate fftw_complex array\n";
-        return nullptr;
-    }
-
-    initializeComplex(input, data, inputLen); // Write real input to complex buffer
-
-    fftw_plan forwardPlan = fftw_plan_dft_1d(inputLen, data, data, FFTW_FORWARD, FFTW_ESTIMATE); // Convert time to freq
-    fftw_execute(forwardPlan); // Execute forward plan
-
-    hilbertFilter(data, inputLen); // In place hilber filter
-
-    fftw_plan inversePlan = fftw_plan_dft_1d(inputLen, data, data, FFTW_BACKWARD, FFTW_ESTIMATE); // Convert freq to time
-    fftw_execute(inversePlan);
-
-    normalizeResult(data, inputLen); // Normalize inverse FFT result
-
-    // Deallocate resources
-    fftw_destroy_plan(forwardPlan);
-    fftw_destroy_plan(inversePlan);
-
-    return data;
-}
-
 // Find time frequency dissimilarity between a time window / its previous window
 double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTimeWin,
-            double fftWin, double fs, int& outLen) {
+    double fftWin, double fs, int& outLen) {
     int pts_per_fft = static_cast<int>(fftWin * fs); // # of samples per FFT
     if (pts_per_fft <= 0 || ptsPerTimewin <= 0 || numTimeWin <= 1) { // Validate input
         outLen = 0;
         return nullptr;
     }
-    
+
     int numfftwin = (ptsPerTimewin - pts_per_fft) / pts_per_fft + 1; // # of FFT windows per segment
     if (numfftwin <= 0) {
         outLen = 0;
@@ -844,14 +823,12 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
         double total = 0.0;
         for (int j = 0; j < half_bins; ++j) total += output[j];
         if (total > 1e-12) {
-            for (int j = 0; j < half_bins; ++j) output[j] /= total;
+            for (int j = 0; j < half_bins; ++j) { output[j] /= total; }
         }
-        else {
-            fill(output, output + half_bins, 0.0); // Avoid division by zero
-        }
-    };
+        else { fill(output, output + half_bins, 0.0); } // Avoid division by zero
+        };
 
-    diss[0] = NAN;  // Set first element to NaN
+    diss[0] = numeric_limits<double>::quiet_NaN();  // Set first element to NaN
 
     // Start at i=1: No previous index for i=0
     int i, k;
@@ -918,7 +895,7 @@ double* calculateDissim(double** timechunkMatrix, int ptsPerTimewin, int numTime
 
 // Calculate dissimilarity between last segment of previous file / first segment of next file
 double calculateCrossFileDissim(const double* lastSeg, int lastSegLen, const double* firstSeg,
-            int firstSegLen, double fftWin, double fs) {
+    int firstSegLen, double fftWin, double fs) {
     int segLen = min(lastSegLen, firstSegLen); // Use shorter segment
     if (segLen <= 0) { return NAN; } // Invalid segment length
 
@@ -1076,8 +1053,8 @@ void freeAudioFeatures(AudioFeatures& features) {
 
 // Main feature extraction
 AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& filePath,
-            double refSens, int timewin, double avtime, int fftWin, int calToneLen, int flow,
-            int fhigh, int downsampleFactor, bool omitPartialMinute) {
+    double refSens, int timewin, double avtime, int fftWin, int calToneLen, int flow,
+    int fhigh, int downsampleFactor, bool omitPartialMinute) {
 
     string fixedFilePath = fixFilePath(filePath.string()); // Make file path Windows compatible
     AudioInfo info = audioread_info(fixedFilePath); // Read all samples / metadata
@@ -1157,7 +1134,9 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     for (int i = 0; i < num_timewin; ++i) {
         timechunk_matrix[i] = &padded_signal[i * pts_per_timewin];
         if (i == num_timewin - 1 && remainder > 0)
-            { features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq)); }
+        {
+            features.segmentDuration[i] = static_cast<int>(round(static_cast<double>(remainder) / sampFreq));
+        }
         else { features.segmentDuration[i] = timewin; }
     }
 
@@ -1202,13 +1181,8 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     for (int i = 0; i < num_timewin; ++i) { features.peakCount[i] = per.peakCount[i]; }
     delete[] per.peakCount;
 
-    features.autocorrRows = per.autocorrRows;
-    features.autocorrCols = per.autocorrCols;
-    features.autocorr = new double* [per.autocorrRows];
-
     // Parallel pointer assignment
 #pragma omp parallel for
-    for (int i = 0; i < per.autocorrRows; ++i) { features.autocorr[i] = per.autocorr[i]; } // Reuse raw pointer
     delete[] per.autocorr; // Free array of pointers
 
     // Dissimilarity calculation
@@ -1257,11 +1231,14 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
 }
 
 // Copy input file name to output file record
-tm extractBaseTime(const string& filename) {
-    tm baseTime = {}; // Fields initialized to zero
+chrono::system_clock::time_point extractBaseTime(const string& filename) {
     smatch match; // Will store matched part
     regex pattern1(R"((\d{8})_(\d{6}))"); // Matches YYYYMMDD_HHMMSS
     regex pattern2(R"(.*\.(\d{6})(\d{6}))"); // Matches XXXX.YYMMDDHHMMSS
+    regex pattern3(R"((\d{8})T(\d{6}))"); // Matches YYYYMMDDTHHMMSS
+
+    tm baseTime = {};
+    bool matched = false;
 
     // Find date / time from file name
     if (regex_search(filename, match, pattern1) && match.size() == 3) {
@@ -1271,9 +1248,10 @@ tm extractBaseTime(const string& filename) {
         baseTime.tm_year = stoi(date.substr(0, 4)) - 1900; // Years since 1900: 4 digits
         baseTime.tm_mon = stoi(date.substr(4, 2)) - 1; // Zero based month
         baseTime.tm_mday = stoi(date.substr(6, 2)); // Day of month
-        baseTime.tm_hour = stoi(time.substr(0, 2)) - 1; // Hour
+        baseTime.tm_hour = stoi(time.substr(0, 2)); // Hour
         baseTime.tm_min = stoi(time.substr(2, 2)); // Minute
         baseTime.tm_sec = stoi(time.substr(4, 2)); // Second
+        matched = true;
     }
     else if (regex_search(filename, match, pattern2) && match.size() == 3) {
         string date = match[1]; // YYMMDD
@@ -1285,17 +1263,36 @@ tm extractBaseTime(const string& filename) {
         else { baseTime.tm_year = year; } // 1941-1999
         baseTime.tm_mon = stoi(date.substr(2, 2)) - 1; // Month
         baseTime.tm_mday = stoi(date.substr(4, 2)); // Day
-        baseTime.tm_hour = stoi(time.substr(0, 2)) - 1; // Hour
+        baseTime.tm_hour = stoi(time.substr(0, 2)); // Hour
         baseTime.tm_min = stoi(time.substr(2, 2)); // Minute
         baseTime.tm_sec = stoi(time.substr(4, 2)); // Second
+        matched = true;
+    }
+    else if (regex_search(filename, match, pattern3) && match.size() == 3) {
+        string date = match[1]; // YYYYMMDD
+        string time = match[2]; // HHMMSS
+
+        baseTime.tm_year = stoi(date.substr(0, 4)) - 1900; // Years since 1900: 4 digits
+        baseTime.tm_mon = stoi(date.substr(4, 2)) - 1; // Zero based month
+        baseTime.tm_mday = stoi(date.substr(6, 2)); // Day of month
+        baseTime.tm_hour = stoi(time.substr(0, 2)); // Hour - removed problematic static variable logic
+        baseTime.tm_min = stoi(time.substr(2, 2)); // Minute
+        baseTime.tm_sec = stoi(time.substr(4, 2)); // Second
+        matched = true;
     }
 
-    return baseTime;
+    if (matched) { // Date/time is present
+        // Explicitly set tm_isdst to -1 to let mktime determine DST
+        baseTime.tm_isdst = -1;
+        time_t epoch = mktime(&baseTime);
+        return chrono::system_clock::from_time_t(epoch);
+    }
+    else { return {}; } // Date/time not present
 }
 
 // Export saved features to CSV file
 void saveFeaturesToCSV(const char* filename, const char** filenames, int numFiles,
-            const AudioFeatures* allFeatures, const vector<double>& crossFileDissim) {
+    const AudioFeatures* allFeatures, const vector<double>& crossFileDissim) {
     ofstream outputFile(filename); // Open file for writing
     if (!outputFile.is_open()) { // Error opening file
         cerr << "Error: Unable to open output file: " << filename << endl;
@@ -1303,7 +1300,7 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
     }
 
     // Write CSV header
-    outputFile << "Filename,Year,Month,Day,Hour,Minute,SegmentDuration,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount\n";
+    outputFile << "Filename,Year,Month,Day,Hour,Minute,DateTime,SegmentDuration,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount\n";
 
     string* fileBuffers = new string[numFiles]; // Allocate file buffers
 
@@ -1318,52 +1315,59 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
         maxLength = features.SPLrmsLen; // Set SPLrmsLen as max length for current file
 
         // Extract timestamp from filename
-        tm baseTime = extractBaseTime(filenames[fileIdx]);
-        time_t baseEpoch = mktime(&baseTime); // Convert to seconds
-        tm* firstTime = localtime(&baseEpoch); // Convert to local time
-
-        // Timestamp extraction unsuccessful
-        bool useNanTimestamp = false;
-        if (!firstTime || (firstTime->tm_year + 1900) < 1900) { useNanTimestamp = true; } // Date / time set to NaN
+        auto baseTime = extractBaseTime(filenames[fileIdx]);
+        bool useNanTimestamp = (baseTime == chrono::system_clock::time_point{});
 
         for (i = 0; i < maxLength; ++i) { // Iterate through time segments
-            time_t currentEpoch = baseEpoch + i * 60;
-            tm* currentTime = localtime(&currentEpoch);
+            auto currentTime = baseTime + chrono::seconds(i * 60);
 
             oss << filenames[fileIdx] << ","; // Original file name
 
-            if (useNanTimestamp || !currentTime) { oss << "NaN,NaN,NaN,NaN,NaN,"; }
+            if (useNanTimestamp) { oss << "NaN,NaN,NaN,NaN,NaN,NaN,"; }
             else {
-                oss << (currentTime->tm_year + 1900) << "," // Year
-                    << (currentTime->tm_mon + 1) << "," // Month
-                    << currentTime->tm_mday << "," // Day
-                    << currentTime->tm_hour << "," // Hour
-                    << currentTime->tm_min << ","; // Minute
+                time_t t = chrono::system_clock::to_time_t(currentTime);
+                tm local_tm = *localtime(&t);
+                oss << (local_tm.tm_year + 1900) << "," // Year
+                    << (local_tm.tm_mon + 1) << "," // Month
+                    << local_tm.tm_mday << "," // Day
+                    << local_tm.tm_hour << "," // Hour
+                    << local_tm.tm_min << ","; // Minute
+                oss << put_time(&local_tm, "%Y-%m-%d %H:%M:%S") << ",";
             }
 
+            auto safeWrite = [&](double value) {
+                if (isnan(value)) { oss << "NaN,"; }
+                else { oss << value << ","; }
+                };
+
+            auto safeWriteLast = [&](double value) {
+                if (isnan(value)) { oss << "NaN"; }
+                else { oss << value; }
+                };
+
             // Segment duration
-            if (i < features.segmentDurationLen) { oss << to_string(features.segmentDuration[i]) << ","; }
-            else { oss << "NaN,"; }
+            if (i < features.segmentDurationLen) safeWrite(features.segmentDuration[i]);
+            else oss << "NaN,";
 
             // SPLrms
-            if (i < features.SPLrmsLen) { oss << to_string(features.SPLrms[i]) << ","; }
-            else { oss << "NaN,"; }
+            if (i < features.SPLrmsLen) safeWrite(features.SPLrms[i]);
+            else oss << "NaN,";
 
             // SPLpk
-            if (i < features.SPLpkLen) { oss << to_string(features.SPLpk[i]) << ","; }
-            else { oss << "NaN,"; }
+            if (i < features.SPLpkLen) safeWrite(features.SPLpk[i]);
+            else oss << "NaN,";
 
             // Impulsivity
-            if (i < features.impulsivityLen) { oss << to_string(features.impulsivity[i]) << ","; }
-            else { oss << "NaN,"; }
+            if (i < features.impulsivityLen) safeWrite(features.impulsivity[i]);
+            else oss << "NaN,";
 
             // Dissim
-            if (i < features.dissimLen) { oss << to_string(features.dissim[i]) << ","; }
-            else { oss << "NaN,"; }
+            if (i < features.dissimLen) safeWrite(features.dissim[i]);
+            else oss << "NaN,";
 
-            // PeakCount
-            if (i < features.peakCountLen) { oss << to_string(features.peakCount[i]); }
-            else { oss << "NaN"; }
+            // PeakCount (last column: no trailing comma)
+            if (i < features.peakCountLen) safeWriteLast(features.peakCount[i]);
+            else oss << "NaN";
 
             oss << "\n"; // End of row
         }
@@ -1383,13 +1387,13 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
 void bubbleSort(char arr[][128], int n) {
     int i, j;
     char temp[128]; // Temporary storage for swapping
-    for (i = 0; i < n-1; ++i) { // # of passes through array
-        for (j = 0; j < n-i-1; ++j) { // Compare adjacent elements / swap if needed
+    for (i = 0; i < n - 1; ++i) { // # of passes through array
+        for (j = 0; j < n - i - 1; ++j) { // Compare adjacent elements / swap if needed
             // Swap if current string is lexicographically greater than previous one
-            if (strcmp(arr[j], arr[j+1]) > 0) {
+            if (strcmp(arr[j], arr[j + 1]) > 0) {
                 strcpy(temp, arr[j]);
-                strcpy(arr[j], arr[j+1]);
-                strcpy(arr[j+1], temp);
+                strcpy(arr[j], arr[j + 1]);
+                strcpy(arr[j + 1], temp);
             }
         }
     }
@@ -1404,20 +1408,18 @@ void threadWrapper(ThreadArgs& args) {
         try {
             if (args.debugOutput == 1) {
                 // Inform user of file processing progress
-                cout << "Processing file index " << index << ": " << args.filePaths[index] << "\n";
+                cout << "Processing file index " << index + 1 << " out of " << args.totalFiles << ": " << args.filePaths[index] << "\n";
                 cerr.flush();
             }
-            
+
             fs::path filePath(args.filePaths[index]); // Convert C-style path to a filesystem::path for safe handling
             string filenameStr = filePath.filename().string(); // Extract filename without path
 
             if (args.fileTimeInfo) { // Extract date / time data if present
-                tm extractedTime = extractBaseTime(filenameStr);
+                auto extractedTime = extractBaseTime(filenameStr);
                 args.fileTimeInfo[index].baseTime = extractedTime;
                 args.fileTimeInfo[index].filename = filenameStr;
-                args.fileTimeInfo[index].timeExtracted =
-                    (extractedTime.tm_year > 0 || extractedTime.tm_mon >= 0 ||
-                     extractedTime.tm_mday > 0 || extractedTime.tm_hour >= 0);
+                args.fileTimeInfo[index].timeExtracted = (extractedTime != chrono::system_clock::time_point{});
             }
 
             // Run feature extraction
@@ -1432,9 +1434,64 @@ void threadWrapper(ThreadArgs& args) {
             args.filenames[index][sizeof(args.filenames[index]) - 1] = '\0';
         }
         catch (const exception& e)
-            { cerr << "Exception in thread while processing index " << index  << ": " << e.what() << "\n"; }
+        {
+            cerr << "Exception in thread while processing index " << index << ": " << e.what() << "\n";
+        }
         catch (...) { cerr << "Unknown exception in thread while processing index " << index << "\n"; }
     }
+}
+
+AudioParams detectAudioParams(const string& filePath) {
+    AudioParams params = { 16, 2, 16000, false }; // Default values
+
+    SF_INFO sfinfo = {};
+    SNDFILE* file = sf_open(filePath.c_str(), SFM_READ, &sfinfo);
+
+    if (!file) {
+        cerr << "Warning: Could not open first file to detect parameters: " << filePath << endl;
+        return params;
+    }
+
+    // Detect bit depth from format
+    int format = sfinfo.format & SF_FORMAT_SUBMASK;
+    switch (format) {
+    case SF_FORMAT_PCM_16:
+        params.num_bits = 16;
+        break;
+    case SF_FORMAT_PCM_24:
+        params.num_bits = 24;
+        break;
+    case SF_FORMAT_PCM_32:
+        params.num_bits = 32;
+        break;
+    default:
+        params.num_bits = 16; // Default to 16-bit
+        break;
+    }
+
+    // Set peak_volts based on bit depth (common values)
+    switch (params.num_bits) {
+    case 16:
+        params.peak_volts = 2;
+        break;
+    case 24:
+        params.peak_volts = 10;
+        break;
+    case 32:
+        params.peak_volts = 10;
+        break;
+    default:
+        params.peak_volts = 2;
+        break;
+    }
+
+    // Set fhigh to Nyquist frequency (half of sample rate)
+    params.fhigh = sfinfo.samplerate / 2;
+
+    sf_close(file);
+    params.success = true;
+
+    return params;
 }
 
 // Process directory of sound files with user-given parameters
@@ -1449,37 +1506,114 @@ int main(int argc, char* argv[]) {
     int num_bits = 16, peak_volts = 2;
     int timewin = 60, fft_win = 1, flow = 1, fhigh = 16000;
     double RS = -178.3, avtime = 0.1, artiLen = 0.0;
-    int max_threads = 1, downsample = -1, debug_output = 0;
+    int availableThreads = thread::hardware_concurrency();
+    if (availableThreads <= 0) { availableThreads = 1; } // Default threads to use
+    int max_threads = availableThreads; // Default to all available threads
+    int downsample = -1, debug_output = 0;
     bool omit_partial_minute = false;
+    bool auto_detect_used = false;
+    bool input_provided = false, output_provided = false, peak_volts_provided = false; // Required parameters
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--omit_partial_minute") == 0) { omit_partial_minute = true; }
-        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) { strcpy(input_dir, argv[++i]); }
-        else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) { strcpy(output_file, argv[++i]); }
-        else if (strcmp(argv[i], "--num_bits") == 0 && i + 1 < argc) { num_bits = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--RS") == 0 && i + 1 < argc) { RS = atof(argv[++i]); }
-        else if (strcmp(argv[i], "--peak_volts") == 0 && i + 1 < argc) { peak_volts = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--arti_len") == 0 && i + 1 < argc) { artiLen = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--timewin") == 0 && i + 1 < argc) { timewin = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--fft_win") == 0 && i + 1 < argc) { fft_win = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--avtime") == 0 && i + 1 < argc) { avtime = atof(argv[++i]); }
-        else if (strcmp(argv[i], "--flow") == 0 && i + 1 < argc) { flow = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--fhigh") == 0 && i + 1 < argc) { fhigh = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--max_threads") == 0 && i + 1 < argc) { max_threads = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--downsample") == 0 && i + 1 < argc) { downsample = atoi(argv[++i]); }
-        else if (strcmp(argv[i], "--debug_output") == 0 && i + 1 < argc) { debug_output = atoi(argv[++i]); }
+        if (strcmp(argv[i], "-omit_partial_minute") == 0) { omit_partial_minute = true; }
+        else if (strcmp(argv[i], "-input") == 0 && i + 1 < argc) {
+            strcpy(input_dir, argv[++i]);
+            input_provided = true;
+        }
+        else if (strcmp(argv[i], "-output") == 0 && i + 1 < argc) {
+            strcpy(output_file, argv[++i]);
+            output_provided = true;
+        }
+        else if (strcmp(argv[i], "-num_bits") == 0 && i + 1 < argc) { num_bits = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-RS") == 0 && i + 1 < argc) { RS = atof(argv[++i]); }
+        else if (strcmp(argv[i], "-peak_volts") == 0 && i + 1 < argc) {
+            peak_volts = atoi(argv[++i]);
+            peak_volts_provided = true;
+        }
+        else if (strcmp(argv[i], "-arti_len") == 0 && i + 1 < argc) { artiLen = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-timewin") == 0 && i + 1 < argc) { timewin = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-fft_win") == 0 && i + 1 < argc) { fft_win = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-avtime") == 0 && i + 1 < argc) { avtime = atof(argv[++i]); }
+        else if (strcmp(argv[i], "-flow") == 0 && i + 1 < argc) { flow = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-fhigh") == 0 && i + 1 < argc) { fhigh = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-max_threads") == 0 && i + 1 < argc) { max_threads = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-downsample") == 0 && i + 1 < argc) { downsample = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "-debug_output") == 0 && i + 1 < argc) { debug_output = atoi(argv[++i]); }
     }
 
-    // Count .wav files
+    // Check for required parameters and display error messages
+    bool has_error = false;
+
+    if (!input_provided) { // Input directory not specified
+        cerr << "Error: Input directory parameter (-input) is required\n";
+        has_error = true;
+    }
+
+    if (!output_provided) { // Output file not specified
+        cerr << "Error: Output file parameter (-output) is required\n";
+        has_error = true;
+    }
+
+    if (!peak_volts_provided) { // Peak volts not specified
+        cerr << "Error: Peak volts parameter (-peak_volts) is required\n";
+        has_error = true;
+    }
+
+    if (has_error) { // Missing 1 or more required parameters
+        cerr << "Usage: program -input <directory> -output <file> -peak_volts <value> [other options...]\n";
+        return 1;
+    }
+
+    // Count .wav files / get first file for parameter detection
     int totalFiles = 0;
+    string firstWavFile;
     for (const auto& entry : fs::directory_iterator(input_dir)) {
-        if (entry.path().extension() == ".wav") { ++totalFiles; } // Only read .wav files
+        if (entry.path().extension() == ".wav") {
+            if (totalFiles == 0) { firstWavFile = entry.path().string(); }
+            ++totalFiles;
+        }
     }
 
     if (totalFiles == 0) { // No .wav files in directory
         cerr << "No valid .wav files found in " << input_dir << "\n";
         return 1;
+    }
+
+    // Auto-detect parameters from first file if not explicitly set by user
+    bool user_set_num_bits = false, user_set_peak_volts = false, user_set_fhigh = false;
+
+    // Check if user explicitly set these parameters
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-num_bits") == 0) user_set_num_bits = true;
+        else if (strcmp(argv[i], "-peak_volts") == 0) user_set_peak_volts = true;
+        else if (strcmp(argv[i], "-fhigh") == 0) user_set_fhigh = true;
+    }
+
+    // Auto-detect parameters if not set by user
+    if (!user_set_num_bits || !user_set_peak_volts || !user_set_fhigh) {
+        AudioParams detected = detectAudioParams(firstWavFile);
+        if (detected.success) {
+            if (!user_set_num_bits) {
+                num_bits = detected.num_bits;
+                auto_detect_used = true;
+            }
+            if (!user_set_peak_volts) {
+                peak_volts = detected.peak_volts;
+                auto_detect_used = true;
+            }
+            if (!user_set_fhigh) {
+                fhigh = detected.fhigh;
+                auto_detect_used = true;
+            }
+
+            if (debug_output == 1 && auto_detect_used) {
+                cout << "Auto-detected parameters from " << firstWavFile << ":\n";
+                if (!user_set_num_bits) cout << "  num_bits: " << num_bits << "\n";
+                if (!user_set_peak_volts) cout << "  peak_volts: " << peak_volts << "\n";
+                if (!user_set_fhigh) cout << "  fhigh: " << fhigh << "\n";
+            }
+        }
     }
 
     // Allocate arrays large enough for all files
@@ -1502,8 +1636,6 @@ int main(int argc, char* argv[]) {
 
     // Thread setup
     atomic<int> nextIndex(0); // Shared atomic counter for file indexing
-    int availableThreads = thread::hardware_concurrency();
-    if (availableThreads <= 0) { availableThreads = 1; } // Default threads to use
     int numThreads = min(max_threads, availableThreads);
 
     // Thread args
@@ -1544,7 +1676,9 @@ int main(int argc, char* argv[]) {
 
         // Assign cross-file dissimilarity to the first segment of the next file
         if (allFeatures[i + 1].dissimLen > 0 && allFeatures[i + 1].dissim)
-            { allFeatures[i + 1].dissim[0] = crossFileDissim; }
+        {
+            allFeatures[i + 1].dissim[0] = crossFileDissim;
+        }
     }
 
     const char** fileNames = new const char* [totalFiles];
