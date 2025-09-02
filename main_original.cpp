@@ -1469,22 +1469,6 @@ AudioParams detectAudioParams(const string& filePath) {
         break;
     }
 
-    // Set peak_volts based on bit depth (common values)
-    switch (params.num_bits) {
-    case 16:
-        params.peak_volts = 2;
-        break;
-    case 24:
-        params.peak_volts = 10;
-        break;
-    case 32:
-        params.peak_volts = 10;
-        break;
-    default:
-        params.peak_volts = 2;
-        break;
-    }
-
     // Set fhigh to Nyquist frequency (half of sample rate)
     params.fhigh = sfinfo.samplerate / 2;
 
