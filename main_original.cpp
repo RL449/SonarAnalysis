@@ -1292,37 +1292,28 @@ chrono::system_clock::time_point extractBaseTime(const string& filename) {
 
 // Export saved features to CSV file
 void saveFeaturesToCSV(const char* filename, const char** filenames, int numFiles,
-    const AudioFeatures* allFeatures, const vector<double>& crossFileDissim) {
+    const AudioFeatures* allFeatures, const double* crossFileDissim, int crossFileDissimLen) {
     ofstream outputFile(filename); // Open file for writing
     if (!outputFile.is_open()) { // Error opening file
         cerr << "Error: Unable to open output file: " << filename << endl;
         return;
     }
-
     // Write CSV header
     outputFile << "Filename,Year,Month,Day,Hour,Minute,DateTime,SegmentDuration,SPLrms,SPLpk,Impulsivity,Dissimilarity,PeakCount\n";
-
     string* fileBuffers = new string[numFiles]; // Allocate file buffers
-
     int fileIdx, i, maxLength; // Single declaration outside of loops
-
     // Write CSV rows per file in parallel
 #pragma omp parallel for
     for (fileIdx = 0; fileIdx < numFiles; ++fileIdx) {
         const AudioFeatures& features = allFeatures[fileIdx]; // Current file features
         ostringstream oss; // Per thread string builder
-
         maxLength = features.SPLrmsLen; // Set SPLrmsLen as max length for current file
-
         // Extract timestamp from filename
         auto baseTime = extractBaseTime(filenames[fileIdx]);
         bool useNanTimestamp = (baseTime == chrono::system_clock::time_point{});
-
         for (i = 0; i < maxLength; ++i) { // Iterate through time segments
             auto currentTime = baseTime + chrono::seconds(i * 60);
-
             oss << filenames[fileIdx] << ","; // Original file name
-
             if (useNanTimestamp) { oss << "NaN,NaN,NaN,NaN,NaN,NaN,"; }
             else {
                 time_t t = chrono::system_clock::to_time_t(currentTime);
@@ -1334,50 +1325,38 @@ void saveFeaturesToCSV(const char* filename, const char** filenames, int numFile
                     << local_tm.tm_min << ","; // Minute
                 oss << put_time(&local_tm, "%Y-%m-%d %H:%M:%S") << ",";
             }
-
             auto safeWrite = [&](double value) {
                 if (isnan(value)) { oss << "NaN,"; }
                 else { oss << value << ","; }
                 };
-
             auto safeWriteLast = [&](double value) {
                 if (isnan(value)) { oss << "NaN"; }
                 else { oss << value; }
                 };
-
             // Segment duration
             if (i < features.segmentDurationLen) safeWrite(features.segmentDuration[i]);
             else oss << "NaN,";
-
             // SPLrms
             if (i < features.SPLrmsLen) safeWrite(features.SPLrms[i]);
             else oss << "NaN,";
-
             // SPLpk
             if (i < features.SPLpkLen) safeWrite(features.SPLpk[i]);
             else oss << "NaN,";
-
             // Impulsivity
             if (i < features.impulsivityLen) safeWrite(features.impulsivity[i]);
             else oss << "NaN,";
-
             // Dissim
             if (i < features.dissimLen) safeWrite(features.dissim[i]);
             else oss << "NaN,";
-
             // PeakCount (last column: no trailing comma)
             if (i < features.peakCountLen) safeWriteLast(features.peakCount[i]);
             else oss << "NaN";
-
             oss << "\n"; // End of row
         }
-
         fileBuffers[fileIdx] = oss.str(); // Per file CSV content in buffer
     }
-
     // Write all buffers sequentially to CSV file
     for (i = 0; i < numFiles; ++i) { outputFile << fileBuffers[i]; }
-
     // Deallocate resources
     delete[] fileBuffers;
     outputFile.close();
@@ -1489,14 +1468,14 @@ int main(int argc, char* argv[]) {
     char output_file[128] = {};
     int num_bits = 16, peak_volts = 2;
     int timewin = 60, fft_win = 1, flow = 1, fhigh = 16000;
-    double RS = -178.3, avtime = 0.1, artiLen = 0.0;
+    double RS = -100.0, avtime = 0.1, artiLen = 0.0;
     int availableThreads = thread::hardware_concurrency();
     if (availableThreads <= 0) { availableThreads = 1; } // Default threads to use
     int max_threads = availableThreads; // Default to all available threads
     int downsample = -1, debug_output = 0;
     bool omit_partial_minute = false;
     bool auto_detect_used = false;
-    bool input_provided = false, output_provided = false, peak_volts_provided = false; // Required parameters
+    bool input_provided = false, output_provided = false; // Required parameters
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -1511,10 +1490,7 @@ int main(int argc, char* argv[]) {
         }
         else if (strcmp(argv[i], "-num_bits") == 0 && i + 1 < argc) { num_bits = atoi(argv[++i]); }
         else if (strcmp(argv[i], "-RS") == 0 && i + 1 < argc) { RS = atof(argv[++i]); }
-        else if (strcmp(argv[i], "-peak_volts") == 0 && i + 1 < argc) {
-            peak_volts = atoi(argv[++i]);
-            peak_volts_provided = true;
-        }
+        else if (strcmp(argv[i], "-peak_volts") == 0 && i + 1 < argc) { peak_volts = atof(argv[++i]); }
         else if (strcmp(argv[i], "-arti_len") == 0 && i + 1 < argc) { artiLen = atoi(argv[++i]); }
         else if (strcmp(argv[i], "-timewin") == 0 && i + 1 < argc) { timewin = atoi(argv[++i]); }
         else if (strcmp(argv[i], "-fft_win") == 0 && i + 1 < argc) { fft_win = atoi(argv[++i]); }
@@ -1539,13 +1515,8 @@ int main(int argc, char* argv[]) {
         has_error = true;
     }
 
-    if (!peak_volts_provided) { // Peak volts not specified
-        cerr << "Error: Peak volts parameter (-peak_volts) is required\n";
-        has_error = true;
-    }
-
     if (has_error) { // Missing 1 or more required parameters
-        cerr << "Usage: program -input <directory> -output <file> -peak_volts <value> [other options...]\n";
+        cerr << "Usage: program -input <directory> -output <file> [other options...]\n";
         return 1;
     }
 
@@ -1659,18 +1630,16 @@ int main(int argc, char* argv[]) {
         );
 
         // Assign cross-file dissimilarity to the first segment of the next file
-        if (allFeatures[i + 1].dissimLen > 0 && allFeatures[i + 1].dissim)
-        {
-            allFeatures[i + 1].dissim[0] = crossFileDissim;
-        }
+        if (allFeatures[i + 1].dissimLen > 0 && allFeatures[i + 1].dissim) { allFeatures[i + 1].dissim[0] = crossFileDissim; }
     }
 
     const char** fileNames = new const char* [totalFiles];
     for (int i = 0; i < totalFiles; ++i) { fileNames[i] = filenames[i]; } // Convert to const char* array
 
     // Save calculated features to output
-    vector<double> crossFileDissimVector; // Empty vector since we're handling it differently now
-    saveFeaturesToCSV(output_file, fileNames, totalFiles, allFeatures, crossFileDissimVector);
+    double* crossFileDissimArray = nullptr; // Empty array
+    int crossFileDissimLen = 0;
+    saveFeaturesToCSV(output_file, fileNames, totalFiles, allFeatures, crossFileDissimArray, crossFileDissimLen);
 
     if (debug_output == 1) {
         // Inform user of file processing progress
