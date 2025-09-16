@@ -1182,7 +1182,7 @@ AudioFeatures featureExtraction(int numBits, int peakVolts, const fs::path& file
     delete[] per.peakCount;
 
     // Parallel pointer assignment
-#pragma omp parallel for
+    for (int i = 0; i < per.autocorrRows; ++i) { delete[] per.autocorr[i]; } // Deallocate rows
     delete[] per.autocorr; // Free array of pointers
 
     // Dissimilarity calculation
