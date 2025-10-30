@@ -905,6 +905,10 @@ double calculateCrossFileDissim(const double* lastSeg, int lastSegLen, const dou
     // For short segments, use entire segment length for FFT
     if (segLen <= pts_per_fft) { pts_per_fft = segLen; }
 
+    // Calculate number of FFT windows per segment
+    int numfftwin = (segLen - pts_per_fft) / pts_per_fft + 1;
+    if (numfftwin <= 0) { return NAN; }
+
     // Amplitude envelopes
     double* env1 = new double[segLen];
     double* env2 = new double[segLen];
@@ -920,11 +924,10 @@ double calculateCrossFileDissim(const double* lastSeg, int lastSegLen, const dou
         return NAN;
     }
 
-    int i, j; // Iterators
     double sum1 = 0.0, sum2 = 0.0;
 
     // Amplitude envelopes / sums
-    for (i = 0; i < segLen; ++i) {
+    for (int i = 0; i < segLen; ++i) {
         env1[i] = hypot(hil1[i][0], hil1[i][1]);
         env2[i] = hypot(hil2[i][0], hil2[i][1]);
         sum1 += env1[i];
@@ -935,82 +938,106 @@ double calculateCrossFileDissim(const double* lastSeg, int lastSegLen, const dou
 
     // Envelope normalization
     if (sum1 > 1e-12) {
-        for (i = 0; i < segLen; ++i) { env1[i] /= sum1; }
+        for (int i = 0; i < segLen; ++i) { env1[i] /= sum1; }
     }
     if (sum2 > 1e-12) {
-        for (i = 0; i < segLen; ++i) { env2[i] /= sum2; }
+        for (int i = 0; i < segLen; ++i) { env2[i] /= sum2; }
     }
 
     // Time domain dissimilarity: Distance between envelopes
     double timeDiss = 0.0;
-    for (i = 0; i < segLen; ++i) { timeDiss += fabs(env1[i] - env2[i]); }
+    for (int i = 0; i < segLen; ++i) { timeDiss += fabs(env1[i] - env2[i]); }
     timeDiss *= 0.5;
 
-    // Frequency-domain dissimilarity: Calculate magnitude spectrum with FFT
+    // Frequency-domain dissimilarity: Calculate magnitude spectrum from ORIGINAL SIGNALS
     int half_bins = pts_per_fft / 2 + 1;
     double* mag1 = new double[pts_per_fft]();
     double* mag2 = new double[pts_per_fft]();
 
-    // Create buffers for FFT input
-    double* fft_input1 = new double[pts_per_fft]();
-    double* fft_input2 = new double[pts_per_fft]();
+    // Create batch FFT resources with thread safe plan creation
+    double* batch_in = (double*)fftw_malloc(sizeof(double) * pts_per_fft * numfftwin);
+    fftw_complex* batch_out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (half_bins * numfftwin));
 
-    // Copy envelope data into FFT buffers (zero-padded if segLen < pts_per_fft)
-    int copy_len = min(segLen, pts_per_fft);
-    memcpy(fft_input1, env1, copy_len * sizeof(double));
-    memcpy(fft_input2, env2, copy_len * sizeof(double));
+    fftw_plan batch_plan;
+    {
+        lock_guard<mutex> lock(fftw_plan_mutex); // Ensure plan creation is serialized
+        batch_plan = fftw_plan_many_dft_r2c(
+            1, // 1D FFT
+            &pts_per_fft, // Array of FFT sizes
+            numfftwin, // # of FFT windows per batch
+            batch_in, // Input array
+            nullptr, // Input strides (default)
+            1, // Input distance between batches
+            pts_per_fft, // Input stride (elements between input points)
+            batch_out, // Output array
+            nullptr, // Output strides (default)
+            1, // Output distance between batches
+            half_bins, // Output stride (complex output length)
+            FFTW_ESTIMATE); // Plan flag
+    }
 
-    // Output buffers
-    fftw_complex* fftbuf1 = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * half_bins);
-    fftw_complex* fftbuf2 = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * half_bins);
+    if (!batch_plan) { // Plan creation unsuccessful
+        fftw_free(batch_in);
+        fftw_free(batch_out);
+        delete[] env1;
+        delete[] env2;
+        delete[] mag1;
+        delete[] mag2;
+        return NAN;
+    }
 
-    // Create / execute plans
-    fftw_plan p1 = fftw_plan_dft_r2c_1d(pts_per_fft, fft_input1, fftbuf1, FFTW_ESTIMATE);
-    fftw_plan p2 = fftw_plan_dft_r2c_1d(pts_per_fft, fft_input2, fftbuf2, FFTW_ESTIMATE);
-    fftw_execute(p1);
-    fftw_execute(p2);
+    // Calculate normalized magnitude spectrum with batched FFT (same as calculateDissim)
+    auto calc_fft_mag_batched = [&](const double* input, double* output) {
+        fill(output, output + pts_per_fft, 0.0);
 
-    // Calculate magnitude spectrum
-    for (j = 0; j < half_bins; ++j) {
-        mag1[j] = sqrt(fftbuf1[j][0] * fftbuf1[j][0] + fftbuf1[j][1] * fftbuf1[j][1]);
-        mag2[j] = sqrt(fftbuf2[j][0] * fftbuf2[j][0] + fftbuf2[j][1] * fftbuf2[j][1]);
-
-        // Mirror for negative frequencies
-        if (j > 0 && j < pts_per_fft - j) {
-            mag1[pts_per_fft - j] = mag1[j];
-            mag2[pts_per_fft - j] = mag2[j];
+        // Write all FFT windows into batch input
+        for (int i = 0; i < numfftwin; ++i) {
+            int copy_len = min(pts_per_fft, segLen - i * pts_per_fft);
+            memcpy(batch_in + i * pts_per_fft, input + i * pts_per_fft, sizeof(double) * copy_len);
+            // Zero-pad if necessary
+            if (copy_len < pts_per_fft) {
+                memset(batch_in + i * pts_per_fft + copy_len, 0, sizeof(double) * (pts_per_fft - copy_len));
+            }
         }
-    }
 
-    // Normalize magnitude spectra
-    double total1 = 0.0, total2 = 0.0;
-    for (j = 0; j < pts_per_fft; ++j) {
-        total1 += mag1[j];
-        total2 += mag2[j];
-    }
-    if (total1 > 1e-12) {
-        for (j = 0; j < pts_per_fft; ++j) { mag1[j] /= total1; }
-    }
-    if (total2 > 1e-12) {
-        for (j = 0; j < pts_per_fft; ++j) { mag2[j] /= total2; }
-    }
+        fftw_execute(batch_plan); // Execute batch FFT
+
+        // Sum magnitudes across all FFT windows
+        for (int j = 0; j < half_bins; ++j) {
+            double mag_sum = 0.0;
+            for (int i = 0; i < numfftwin; ++i) {
+                fftw_complex& c = batch_out[i * half_bins + j];
+                mag_sum += sqrt(c[0] * c[0] + c[1] * c[1]);
+            }
+            output[j] = mag_sum;
+        }
+
+        // Normalize magnitude spectrum
+        double total = 0.0;
+        for (int j = 0; j < half_bins; ++j) total += output[j];
+        if (total > 1e-12) {
+            for (int j = 0; j < half_bins; ++j) { output[j] /= total; }
+        }
+        else { fill(output, output + half_bins, 0.0); } // Avoid division by zero
+        };
+
+    // Calculate FFT magnitude from ORIGINAL signals (not envelopes)
+    calc_fft_mag_batched(lastSeg, mag1);
+    calc_fft_mag_batched(firstSeg, mag2);
 
     // Frequency domain dissimilarity
     double freqDiss = 0.0;
-    for (j = 0; j < pts_per_fft; ++j) { freqDiss += fabs(mag1[j] - mag2[j]); }
+    for (int j = 0; j < half_bins; ++j) { freqDiss += fabs(mag1[j] - mag2[j]); }
     freqDiss *= 0.5;
 
     // Deallocate resources
-    fftw_destroy_plan(p1);
-    fftw_destroy_plan(p2);
-    fftw_free(fftbuf1);
-    fftw_free(fftbuf2);
+    fftw_destroy_plan(batch_plan);
+    fftw_free(batch_in);
+    fftw_free(batch_out);
     delete[] env1;
     delete[] env2;
     delete[] mag1;
     delete[] mag2;
-    delete[] fft_input1;
-    delete[] fft_input2;
 
     return timeDiss * freqDiss; // Combined dissimilarity
 }
